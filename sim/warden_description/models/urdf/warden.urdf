@@ -1,0 +1,253 @@
+<?xml version="1.0" ?>
+<!-- Generated using onshape-to-robot -->
+<!-- Onshape document_id: a95faf3a4f281cc41b4edebe / workspace_id: 843dbb8636a14d7052eaf3cc -->
+<robot name="warden">
+  <!-- Link base_link -->
+  <link name="base_link">
+    <inertial>
+      <origin xyz="0.111758 0.0613685 0.00349625" rpy="0 0 0"/>
+      <mass value="0.576715"/>
+      <inertia ixx="0.000708516" ixy="0" ixz="-2.75267e-05" iyy="0.00163298" iyz="0" izz="0.00226536"/>
+    </inertial>
+    <!-- Part base_link -->
+    <visual>
+      <origin xyz="0.0204942 0.00174666 -0.0270738" rpy="0 -0 0"/>
+      <geometry>
+        <mesh filename="package://warden_description/models/meshes/base_link.stl"/>
+      </geometry>
+      <material name="base_link_material">
+        <color rgba="0.737255 0.937255 0.917647 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0.0204942 0.00174666 -0.0270738" rpy="0 -0 0"/>
+      <geometry>
+        <mesh filename="package://warden_description/models/meshes/base_link.stl"/>
+      </geometry>
+    </collision>
+  </link>
+  <!-- Link right_wheel_link -->
+  <link name="right_wheel_link">
+    <inertial>
+      <origin xyz="0 0 -0.0075" rpy="0 0 0"/>
+      <mass value="0.00123936"/>
+      <inertia ixx="3.0984e-08" ixy="0" ixz="0" iyy="3.0984e-08" iyz="0" izz="1.5492e-08"/>
+    </inertial>
+    <!-- Part right_wheel_link -->
+    <visual>
+      <origin xyz="-0.0349958 0.03 0.000378129" rpy="1.5708 -0 0"/>
+      <geometry>
+        <mesh filename="package://warden_description/models/meshes/right_wheel_link.stl"/>
+      </geometry>
+      <material name="right_wheel_link_material">
+        <color rgba="0.701961 0.701961 0.701961 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="-0.0349958 0.03 0.000378129" rpy="1.5708 -0 0"/>
+      <geometry>
+        <mesh filename="package://warden_description/models/meshes/right_wheel_link.stl"/>
+      </geometry>
+    </collision>
+  </link>
+  <!-- Joint from base_link to right_wheel_link -->
+  <joint name="right_joint" type="fixed">
+    <origin xyz="0.05549 0.00136853 0.00292621" rpy="-1.5708 -0 0"/>
+    <parent link="base_link"/>
+    <child link="right_wheel_link"/>
+    <axis xyz="0 0 1"/>
+    <limit effort="10" velocity="10"/>
+  </joint>
+  <!-- Link left_wheel_link -->
+  <link name="left_wheel_link">
+    <inertial>
+      <origin xyz="-0 0 -0.0075" rpy="0 0 0"/>
+      <mass value="0.00123936"/>
+      <inertia ixx="3.0984e-08" ixy="0" ixz="0" iyy="3.0984e-08" iyz="0" izz="1.5492e-08"/>
+    </inertial>
+    <!-- Part left_wheel_link -->
+    <visual>
+      <origin xyz="-0.0349958 -0.03 0.119622" rpy="-1.5708 -0 0"/>
+      <geometry>
+        <mesh filename="package://warden_description/models/meshes/left_wheel_link.stl"/>
+      </geometry>
+      <material name="left_wheel_link_material">
+        <color rgba="0.701961 0.701961 0.701961 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="-0.0349958 -0.03 0.119622" rpy="-1.5708 -0 0"/>
+      <geometry>
+        <mesh filename="package://warden_description/models/meshes/left_wheel_link.stl"/>
+      </geometry>
+    </collision>
+  </link>
+  <!-- Joint from base_link to left_wheel_link -->
+  <joint name="left_joint" type="fixed">
+    <origin xyz="0.05549 0.121369 0.00292621" rpy="1.5708 -0 0"/>
+    <parent link="base_link"/>
+    <child link="left_wheel_link"/>
+    <axis xyz="0 0 1"/>
+    <limit effort="10" velocity="10"/>
+  </joint>
+  <!-- Link caster -->
+  <link name="caster">
+    <inertial>
+      <origin xyz="0 0 -0.0065625" rpy="0 0 0"/>
+      <mass value="0.0881135"/>
+      <inertia ixx="6.99917e-06" ixy="0" ixz="-0" iyy="6.99917e-06" iyz="0" izz="1.07939e-05"/>
+    </inertial>
+    <!-- Part caster -->
+    <visual>
+      <origin xyz="-0.149996 -0.0571219 -0.0175" rpy="0 -0 0"/>
+      <geometry>
+        <mesh filename="package://warden_description/models/meshes/caster.stl"/>
+      </geometry>
+      <material name="caster_material">
+        <color rgba="0.701961 0.701961 0.701961 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="-0.149996 -0.0571219 -0.0175" rpy="0 -0 0"/>
+      <geometry>
+        <mesh filename="package://warden_description/models/meshes/caster.stl"/>
+      </geometry>
+    </collision>
+  </link>
+  <!-- Joint from base_link to caster -->
+  <joint name="caster_joint" type="fixed">
+    <origin xyz="0.17049 0.0613685 -0.00957379" rpy="0 -0 0"/>
+    <parent link="base_link"/>
+    <child link="caster"/>
+    <axis xyz="0 0 1"/>
+    <limit effort="10" velocity="10"/>
+  </joint>
+  <!-- Link right -->
+  <link name="right">
+    <inertial>
+      <origin xyz="0 -0 -0.0275" rpy="0 0 0"/>
+      <mass value="0.0743615"/>
+      <inertia ixx="2.06043e-05" ixy="0" ixz="0" iyy="2.06043e-05" iyz="0" izz="3.34627e-05"/>
+    </inertial>
+    <!-- Part right -->
+    <visual>
+      <origin xyz="0.0455868 0.052388 -0.015" rpy="1.5708 -0 -1.32919"/>
+      <geometry>
+        <mesh filename="package://warden_description/models/meshes/right.stl"/>
+      </geometry>
+      <material name="right_material">
+        <color rgba="0.262745 0.282353 0.301961 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0.0455868 0.052388 -0.015" rpy="1.5708 -0 -1.32919"/>
+      <geometry>
+        <mesh filename="package://warden_description/models/meshes/right.stl"/>
+      </geometry>
+    </collision>
+  </link>
+  <!-- Joint from base_link to right -->
+  <joint name="right_wheel_joint" type="continuous">
+    <origin xyz="0.05549 0.00136853 0.00292621" rpy="-1.5708 -0 0"/>
+    <parent link="base_link"/>
+    <child link="right"/>
+    <axis xyz="0 0 1"/>
+    <limit effort="10" velocity="10"/>
+  </joint>
+  <!-- Link left -->
+  <link name="left">
+    <inertial>
+      <origin xyz="-0 -0 0.0275" rpy="0 0 0"/>
+      <mass value="0.0743615"/>
+      <inertia ixx="2.06043e-05" ixy="-0" ixz="-0" iyy="2.06043e-05" iyz="0" izz="3.34627e-05"/>
+    </inertial>
+    <!-- Part left -->
+    <visual>
+      <origin xyz="0.0645654 0.0175969 0.04" rpy="1.5708 -0 -1.91675"/>
+      <geometry>
+        <mesh filename="package://warden_description/models/meshes/left.stl"/>
+      </geometry>
+      <material name="left_material">
+        <color rgba="0.301961 0.301961 0.301961 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0.0645654 0.0175969 0.04" rpy="1.5708 -0 -1.91675"/>
+      <geometry>
+        <mesh filename="package://warden_description/models/meshes/left.stl"/>
+      </geometry>
+    </collision>
+  </link>
+  <!-- Joint from base_link to left -->
+  <joint name="left_wheel_joint" type="continuous">
+    <origin xyz="0.05549 0.121369 0.00292621" rpy="1.5708 -0 -3.14159"/>
+    <parent link="base_link"/>
+    <child link="left"/>
+    <axis xyz="0 0 1"/>
+    <limit effort="10" velocity="10"/>
+  </joint>
+  <!-- Link tof_sensor -->
+  <link name="tof_sensor">
+    <inertial>
+      <origin xyz="0.025 -0.005 -0.0025" rpy="0 0 0"/>
+      <mass value="0.001578"/>
+      <inertia ixx="1.6438e-08" ixy="0" ixz="0" iyy="1.21638e-07" iyz="-0" izz="1.315e-07"/>
+    </inertial>
+    <!-- Part tof_sensor -->
+    <visual>
+      <origin xyz="-0.0346219 0.0425 0.179996" rpy="1.5708 1.5708 0"/>
+      <geometry>
+        <mesh filename="package://warden_description/models/meshes/tof_sensor.stl"/>
+      </geometry>
+      <material name="tof_sensor_material">
+        <color rgba="0.764706 0.545098 0.803922 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="-0.0346219 0.0425 0.179996" rpy="1.5708 1.5708 0"/>
+      <geometry>
+        <mesh filename="package://warden_description/models/meshes/tof_sensor.stl"/>
+      </geometry>
+    </collision>
+  </link>
+  <!-- Joint from base_link to tof_sensor -->
+  <joint name="TOF_joint" type="fixed">
+    <origin xyz="0.20049 0.0363685 0.0154262" rpy="-1.5708 -0 1.5708"/>
+    <parent link="base_link"/>
+    <child link="tof_sensor"/>
+    <axis xyz="0 0 1"/>
+    <limit effort="10" velocity="10"/>
+  </joint>
+  <!-- Link camera -->
+  <link name="camera">
+    <inertial>
+      <origin xyz="0.0025 0 0" rpy="0 0 0"/>
+      <mass value="0.00163363"/>
+      <inertia ixx="8.1681e-08" ixy="0" ixz="-0" iyy="4.4244e-08" iyz="0" izz="4.4244e-08"/>
+    </inertial>
+    <!-- Part camera -->
+    <visual>
+      <origin xyz="0.184996 -0.0675 -0.0596219" rpy="1.5708 -0 3.14159"/>
+      <geometry>
+        <mesh filename="package://warden_description/models/meshes/camera.stl"/>
+      </geometry>
+      <material name="camera_material">
+        <color rgba="0.972549 0.529412 0.00392157 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0.184996 -0.0675 -0.0596219" rpy="1.5708 -0 3.14159"/>
+      <geometry>
+        <mesh filename="package://warden_description/models/meshes/camera.stl"/>
+      </geometry>
+    </collision>
+  </link>
+  <!-- Joint from base_link to camera -->
+  <joint name="camera_jt" type="fixed">
+    <origin xyz="0.20049 0.0613685 0.0404262" rpy="3.14159 0 0"/>
+    <parent link="base_link"/>
+    <child link="camera"/>
+    <axis xyz="0 0 1"/>
+    <limit effort="10" velocity="10"/>
+  </joint>
+</robot>

@@ -1,0 +1,240 @@
+<?xml version="1.0"?>
+<sdf version="1.6">
+  <world name="warden_arena">
+
+    <!-- ── Physics ──────────────────────────────────────────────────────── -->
+    <physics type="ode">
+      <real_time_update_rate>1000</real_time_update_rate>
+      <max_step_size>0.001</max_step_size>
+      <real_time_factor>1</real_time_factor>
+    </physics>
+
+    <!-- ── Lighting ─────────────────────────────────────────────────────── -->
+    <light type="directional" name="sun">
+      <cast_shadows>true</cast_shadows>
+      <pose>0 0 10 0 -0 0</pose>
+      <diffuse>1 1 1 1</diffuse>
+      <specular>0.2 0.2 0.2 1</specular>
+      <attenuation>
+        <range>1000</range>
+        <constant>0.9</constant>
+        <linear>0.01</linear>
+        <quadratic>0.001</quadratic>
+      </attenuation>
+      <direction>-0.5 0.1 -0.9</direction>
+    </light>
+
+    <!-- ── Ground plane ─────────────────────────────────────────────────── -->
+    <include>
+      <uri>model://ground_plane</uri>
+    </include>
+
+    <!-- ════════════════════════════════════════════════════════════════════
+         ARUCO CORNER MARKERS — flat 15 cm × 15 cm pads, 2 mm thick.
+         Mapping matches warp_live_test.py CORNER_DST:
+           ID 0 → top-left  of warped image  → (0, 2) in Gazebo
+           ID 1 → top-right of warped image  → (2, 2) in Gazebo
+           ID 2 → bot-right of warped image  → (2, 0) in Gazebo
+           ID 3 → bot-left  of warped image  → (0, 0) in Gazebo
+         (Camera sees arena from above; +Y in Gazebo = up in the image.)
+         ════════════════════════════════════════════════════════════════════ -->
+
+    <!-- ArUco ID 0 — top-left in warp → (0, 2) corner -->
+    <model name="aruco_0">
+      <static>true</static>
+      <pose>0.075 1.925 0.001 0 0 0</pose>
+      <link name="link">
+        <visual name="vis">
+          <geometry><box><size>0.15 0.15 0.002</size></box></geometry>
+          <material>
+            <script>
+              <uri>model://warden_description/materials/scripts/</uri>
+              <uri>model://warden_description/materials/textures/</uri>
+              <name>warden_description/aruco_0</name>
+            </script>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- ArUco ID 1 — top-right in warp → (2, 2) corner -->
+    <model name="aruco_1">
+      <static>true</static>
+      <pose>1.925 1.925 0.001 0 0 0</pose>
+      <link name="link">
+        <visual name="vis">
+          <geometry><box><size>0.15 0.15 0.002</size></box></geometry>
+          <material>
+            <script>
+              <uri>model://warden_description/materials/scripts/</uri>
+              <uri>model://warden_description/materials/textures/</uri>
+              <name>warden_description/aruco_1</name>
+            </script>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- ArUco ID 2 — bot-right in warp → (2, 0) corner -->
+    <model name="aruco_2">
+      <static>true</static>
+      <pose>1.925 0.075 0.001 0 0 0</pose>
+      <link name="link">
+        <visual name="vis">
+          <geometry><box><size>0.15 0.15 0.002</size></box></geometry>
+          <material>
+            <script>
+              <uri>model://warden_description/materials/scripts/</uri>
+              <uri>model://warden_description/materials/textures/</uri>
+              <name>warden_description/aruco_2</name>
+            </script>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- ArUco ID 3 — bot-left in warp → (0, 0) corner -->
+    <model name="aruco_3">
+      <static>true</static>
+      <pose>0.075 0.075 0.001 0 0 0</pose>
+      <link name="link">
+        <visual name="vis">
+          <geometry><box><size>0.15 0.15 0.002</size></box></geometry>
+          <material>
+            <script>
+              <uri>model://warden_description/materials/scripts/</uri>
+              <uri>model://warden_description/materials/textures/</uri>
+              <name>warden_description/aruco_3</name>
+            </script>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- ════════════════════════════════════════════════════════════════════
+         INSPECTION BOXES — 10 cm cubes, lined up near the north wall (y=1.70).
+         Bot spawns at (0,0); boxes are at the opposite (far) edge, evenly spaced.
+         Colors match fault_config: red=FAULT, green=OK.
+         ════════════════════════════════════════════════════════════════════ -->
+
+    <!-- Box ID 10 — FAULT — (0.40, 1.70) -->
+    <model name="box_10">
+      <static>true</static>
+      <pose>0.40 1.70 0.05 0 0 0</pose>
+      <link name="link">
+        <collision name="col">
+          <geometry><box><size>0.10 0.10 0.10</size></box></geometry>
+        </collision>
+        <visual name="vis">
+          <geometry><box><size>0.10 0.10 0.10</size></box></geometry>
+          <material>
+            <ambient>0.8 0.1 0.1 1</ambient>
+            <diffuse>0.8 0.1 0.1 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- Box ID 11 — OK — (0.85, 1.70) -->
+    <model name="box_11">
+      <static>true</static>
+      <pose>0.85 1.70 0.05 0 0 0</pose>
+      <link name="link">
+        <collision name="col">
+          <geometry><box><size>0.10 0.10 0.10</size></box></geometry>
+        </collision>
+        <visual name="vis">
+          <geometry><box><size>0.10 0.10 0.10</size></box></geometry>
+          <material>
+            <ambient>0.1 0.7 0.1 1</ambient>
+            <diffuse>0.1 0.7 0.1 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- Box ID 12 — FAULT — (1.35, 1.70) -->
+    <model name="box_12">
+      <static>true</static>
+      <pose>1.35 1.70 0.05 0 0 0</pose>
+      <link name="link">
+        <collision name="col">
+          <geometry><box><size>0.10 0.10 0.10</size></box></geometry>
+        </collision>
+        <visual name="vis">
+          <geometry><box><size>0.10 0.10 0.10</size></box></geometry>
+          <material>
+            <ambient>0.8 0.1 0.1 1</ambient>
+            <diffuse>0.8 0.1 0.1 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- Box ID 13 — OK — (1.60, 1.70) -->
+    <model name="box_13">
+      <static>true</static>
+      <pose>1.60 1.70 0.05 0 0 0</pose>
+      <link name="link">
+        <collision name="col">
+          <geometry><box><size>0.10 0.10 0.10</size></box></geometry>
+        </collision>
+        <visual name="vis">
+          <geometry><box><size>0.10 0.10 0.10</size></box></geometry>
+          <material>
+            <ambient>0.1 0.7 0.1 1</ambient>
+            <diffuse>0.1 0.7 0.1 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- ════════════════════════════════════════════════════════════════════
+         OVERHEAD CAMERA — static mount at (2.5, 1.0, 3.0).
+         Pose: position outside the arena on the +X side, 3 m tall.
+         Orientation: yaw=π faces the camera toward -X; pitch tilts it
+         down ~63° so the optical axis points at the arena centre (1.0, 1.0).
+         roll=0  pitch=-1.1071  yaw=3.14159  (all in radians)
+         The camera publishes on /overhead_camera/image_raw at 30 Hz.
+         ════════════════════════════════════════════════════════════════════ -->
+    <model name="overhead_camera">
+      <static>true</static>
+      <pose>1.0 1.0 3.0 0 1.5708 0</pose>
+      <link name="link">
+        <!-- Small box so the mount is visible in Gazebo -->
+        <visual name="body_vis">
+          <geometry><box><size>0.05 0.05 0.05</size></box></geometry>
+          <material>
+            <ambient>0.1 0.1 0.8 1</ambient>
+            <diffuse>0.1 0.1 0.8 1</diffuse>
+          </material>
+        </visual>
+
+        <sensor name="overhead_camera_sensor" type="camera">
+          <update_rate>30.0</update_rate>
+          <camera>
+            <horizontal_fov>1.0472</horizontal_fov>   <!-- 60 degrees -->
+            <image>
+              <width>640</width>
+              <height>480</height>
+              <format>R8G8B8</format>
+            </image>
+            <clip>
+              <near>0.1</near>
+              <far>10.0</far>
+            </clip>
+          </camera>
+          <plugin name="overhead_camera_plugin" filename="libgazebo_ros_camera.so">
+            <ros>
+              <remapping>image_raw:=/overhead_camera/image_raw</remapping>
+              <remapping>camera_info:=/overhead_camera/camera_info</remapping>
+            </ros>
+            <camera_name>overhead_camera</camera_name>
+            <frame_name>overhead_camera_link</frame_name>
+          </plugin>
+        </sensor>
+      </link>
+    </model>
+
+  </world>
+</sdf>
