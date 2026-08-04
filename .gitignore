@@ -48,4 +48,6 @@ Thumbs.db
 *.db3
 *.mcap
 frames.pdf
+frames_*.pdf
+frames_*.gv
 scada.log
