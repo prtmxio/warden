@@ -65,3 +65,88 @@ material warden_description/aruco_3
     }
   }
 }
+
+material warden_description/aruco_5
+{
+  technique
+  {
+    pass
+    {
+      ambient 1 1 1 1
+      diffuse 1 1 1 1
+      texture_unit
+      {
+        texture id_5.png
+        scale 1 1
+      }
+    }
+  }
+}
+
+material warden_description/aruco_10
+{
+  technique
+  {
+    pass
+    {
+      ambient 1 1 1 1
+      diffuse 1 1 1 1
+      texture_unit
+      {
+        texture id_10.png
+        scale 1 1
+      }
+    }
+  }
+}
+
+material warden_description/aruco_11
+{
+  technique
+  {
+    pass
+    {
+      ambient 1 1 1 1
+      diffuse 1 1 1 1
+      texture_unit
+      {
+        texture id_11.png
+        scale 1 1
+      }
+    }
+  }
+}
+
+material warden_description/aruco_12
+{
+  technique
+  {
+    pass
+    {
+      ambient 1 1 1 1
+      diffuse 1 1 1 1
+      texture_unit
+      {
+        texture id_12.png
+        scale 1 1
+      }
+    }
+  }
+}
+
+material warden_description/aruco_13
+{
+  technique
+  {
+    pass
+    {
+      ambient 1 1 1 1
+      diffuse 1 1 1 1
+      texture_unit
+      {
+        texture id_13.png
+        scale 1 1
+      }
+    }
+  }
+}

@@ -10,14 +10,12 @@
   <!-- cost maps and robot footprint calculations.                   -->
   <!-- Also update robot_base_frame in your .gazebo diff_drive plugin-->
   <!-- from base_link to base_footprint when uncommenting.           -->
-  <!--
   <link name="base_footprint"/>
   <joint name="base_footprint_joint" type="fixed">
     <parent link="base_footprint"/>
     <child link="base_link"/>
     <origin xyz="0 0 0" rpy="0 0 0"/>
   </joint>
-  -->
 
   <!-- ── base_link ── -->
   <link name="base_link">
@@ -276,6 +274,30 @@
   </joint>
 
 
+  <!-- ── aruco_top — ArUco ID 5 marker visible from overhead camera ── -->
+  <link name="aruco_top">
+    <inertial>
+      <mass value="0.001"/>
+      <inertia ixx="3e-7" ixy="0" ixz="0" iyy="3e-7" iyz="0" izz="6e-7"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><box size="0.1 0.1 0.003"/></geometry>
+      <material name="aruco_top_rvis">
+        <color rgba="1 0.85 0 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><box size="0.1 0.1 0.003"/></geometry>
+    </collision>
+  </link>
+  <joint name="aruco_top_joint" type="fixed">
+    <origin xyz="0.11 0.06 0.015" rpy="0 0 0"/>
+    <parent link="base_link"/>
+    <child link="aruco_top"/>
+  </joint>
+
   <!-- ═══ Camera optical frames (ROS REP 103 / image_geometry convention) ══ -->
   <link name="tof_sensor_optical_frame"/>
   <joint name="tof_sensor_optical_joint" type="fixed">
@@ -289,4 +311,5 @@
     <child link="camera_optical_frame"/>
     <origin xyz="0 0 0" rpy="1.570796 -0.000003 1.570796"/>
   </joint>
+
 </robot>

@@ -33,9 +33,7 @@
       <publish_odom_tf>true</publish_odom_tf>
       <publish_wheel_tf>false</publish_wheel_tf>
       <odometry_frame>odom</odometry_frame>
-      <robot_base_frame>base_link</robot_base_frame>
-      <!-- <robot_base_frame>base_footprint</robot_base_frame> -->
-      <!-- ↑ uncomment and comment the line above when using Nav2 (requires base_footprint in xacro) -->
+      <robot_base_frame>base_footprint</robot_base_frame>
     </plugin>
   </gazebo>
 
@@ -185,6 +183,13 @@
   </gazebo>
 
   <gazebo reference="camera_jt">
+    <preserveFixedJoint>true</preserveFixedJoint>
+  </gazebo>
+
+  <gazebo reference="aruco_top">
+    <material>warden_description/aruco_5</material>
+  </gazebo>
+  <gazebo reference="aruco_top_joint">
     <preserveFixedJoint>true</preserveFixedJoint>
   </gazebo>
 

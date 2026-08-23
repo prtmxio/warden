@@ -1,0 +1,170 @@
+material warden_description/aruco_0
+{
+    receive_shadows off
+    technique
+    {
+        pass
+        {
+            ambient 1 1 1 1
+            diffuse 1 1 1 1
+            specular 0 0 0 0
+            texture_unit
+            {
+                texture id_0.png
+                filtering bilinear
+            }
+        }
+    }
+}
+
+material warden_description/aruco_1
+{
+    receive_shadows off
+    technique
+    {
+        pass
+        {
+            ambient 1 1 1 1
+            diffuse 1 1 1 1
+            specular 0 0 0 0
+            texture_unit
+            {
+                texture id_1.png
+                filtering bilinear
+            }
+        }
+    }
+}
+
+material warden_description/aruco_2
+{
+    receive_shadows off
+    technique
+    {
+        pass
+        {
+            ambient 1 1 1 1
+            diffuse 1 1 1 1
+            specular 0 0 0 0
+            texture_unit
+            {
+                texture id_2.png
+                filtering bilinear
+            }
+        }
+    }
+}
+
+material warden_description/aruco_3
+{
+    receive_shadows off
+    technique
+    {
+        pass
+        {
+            ambient 1 1 1 1
+            diffuse 1 1 1 1
+            specular 0 0 0 0
+            texture_unit
+            {
+                texture id_3.png
+                filtering bilinear
+            }
+        }
+    }
+}
+
+material warden_description/aruco_5
+{
+    receive_shadows off
+    technique
+    {
+        pass
+        {
+            ambient 1 1 1 1
+            diffuse 1 1 1 1
+            specular 0 0 0 0
+            texture_unit
+            {
+                texture id_5.png
+                filtering bilinear
+            }
+        }
+    }
+}
+
+material warden_description/aruco_10
+{
+    receive_shadows off
+    technique
+    {
+        pass
+        {
+            ambient 1 1 1 1
+            diffuse 1 1 1 1
+            specular 0 0 0 0
+            texture_unit
+            {
+                texture id_10.png
+                filtering bilinear
+            }
+        }
+    }
+}
+
+material warden_description/aruco_11
+{
+    receive_shadows off
+    technique
+    {
+        pass
+        {
+            ambient 1 1 1 1
+            diffuse 1 1 1 1
+            specular 0 0 0 0
+            texture_unit
+            {
+                texture id_11.png
+                filtering bilinear
+            }
+        }
+    }
+}
+
+material warden_description/aruco_12
+{
+    receive_shadows off
+    technique
+    {
+        pass
+        {
+            ambient 1 1 1 1
+            diffuse 1 1 1 1
+            specular 0 0 0 0
+            texture_unit
+            {
+                texture id_12.png
+                filtering bilinear
+            }
+        }
+    }
+}
+
+material warden_description/aruco_13
+{
+    receive_shadows off
+    technique
+    {
+        pass
+        {
+            ambient 1 1 1 1
+            diffuse 1 1 1 1
+            specular 0 0 0 0
+            texture_unit
+            {
+                texture id_13.png
+                filtering bilinear
+            }
+        }
+    }
+}

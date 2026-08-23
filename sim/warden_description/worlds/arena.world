@@ -48,8 +48,8 @@
           <geometry><box><size>0.15 0.15 0.002</size></box></geometry>
           <material>
             <script>
-              <uri>model://warden_description/materials/scripts/</uri>
-              <uri>model://warden_description/materials/textures/</uri>
+              <uri>model://warden_description/media/materials/scripts/</uri>
+              <uri>model://warden_description/media/materials/textures/</uri>
               <name>warden_description/aruco_0</name>
             </script>
           </material>
@@ -66,8 +66,8 @@
           <geometry><box><size>0.15 0.15 0.002</size></box></geometry>
           <material>
             <script>
-              <uri>model://warden_description/materials/scripts/</uri>
-              <uri>model://warden_description/materials/textures/</uri>
+              <uri>model://warden_description/media/materials/scripts/</uri>
+              <uri>model://warden_description/media/materials/textures/</uri>
               <name>warden_description/aruco_1</name>
             </script>
           </material>
@@ -84,8 +84,8 @@
           <geometry><box><size>0.15 0.15 0.002</size></box></geometry>
           <material>
             <script>
-              <uri>model://warden_description/materials/scripts/</uri>
-              <uri>model://warden_description/materials/textures/</uri>
+              <uri>model://warden_description/media/materials/scripts/</uri>
+              <uri>model://warden_description/media/materials/textures/</uri>
               <name>warden_description/aruco_2</name>
             </script>
           </material>
@@ -102,8 +102,8 @@
           <geometry><box><size>0.15 0.15 0.002</size></box></geometry>
           <material>
             <script>
-              <uri>model://warden_description/materials/scripts/</uri>
-              <uri>model://warden_description/materials/textures/</uri>
+              <uri>model://warden_description/media/materials/scripts/</uri>
+              <uri>model://warden_description/media/materials/textures/</uri>
               <name>warden_description/aruco_3</name>
             </script>
           </material>
@@ -132,6 +132,17 @@
             <diffuse>0.8 0.1 0.1 1</diffuse>
           </material>
         </visual>
+        <visual name="aruco_vis">
+          <pose>-0.051 0 0 0 0 0</pose>
+          <geometry><box><size>0.002 0.08 0.08</size></box></geometry>
+          <material>
+            <script>
+              <uri>model://warden_description/media/materials/scripts/</uri>
+              <uri>model://warden_description/media/materials/textures/</uri>
+              <name>warden_description/aruco_10</name>
+            </script>
+          </material>
+        </visual>
       </link>
     </model>
 
@@ -148,6 +159,17 @@
           <material>
             <ambient>0.1 0.7 0.1 1</ambient>
             <diffuse>0.1 0.7 0.1 1</diffuse>
+          </material>
+        </visual>
+        <visual name="aruco_vis">
+          <pose>-0.051 0 0 0 0 0</pose>
+          <geometry><box><size>0.002 0.08 0.08</size></box></geometry>
+          <material>
+            <script>
+              <uri>model://warden_description/media/materials/scripts/</uri>
+              <uri>model://warden_description/media/materials/textures/</uri>
+              <name>warden_description/aruco_11</name>
+            </script>
           </material>
         </visual>
       </link>
@@ -168,6 +190,17 @@
             <diffuse>0.8 0.1 0.1 1</diffuse>
           </material>
         </visual>
+        <visual name="aruco_vis">
+          <pose>-0.051 0 0 0 0 0</pose>
+          <geometry><box><size>0.002 0.08 0.08</size></box></geometry>
+          <material>
+            <script>
+              <uri>model://warden_description/media/materials/scripts/</uri>
+              <uri>model://warden_description/media/materials/textures/</uri>
+              <name>warden_description/aruco_12</name>
+            </script>
+          </material>
+        </visual>
       </link>
     </model>
 
@@ -184,6 +217,92 @@
           <material>
             <ambient>0.1 0.7 0.1 1</ambient>
             <diffuse>0.1 0.7 0.1 1</diffuse>
+          </material>
+        </visual>
+        <visual name="aruco_vis">
+          <pose>-0.051 0 0 0 0 0</pose>
+          <geometry><box><size>0.002 0.08 0.08</size></box></geometry>
+          <material>
+            <script>
+              <uri>model://warden_description/media/materials/scripts/</uri>
+              <uri>model://warden_description/media/materials/textures/</uri>
+              <name>warden_description/aruco_13</name>
+            </script>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- ════════════════════════════════════════════════════════════════════
+         ARUCO FACE MARKERS — thin 8 cm × 8 cm planes on south face of each
+         inspection box, facing the approaching bot (−Y direction).
+         Box centres at (x, 1.70, 0.05); south face at y=1.65; plane at y=1.644
+         to avoid z-fighting.
+         ════════════════════════════════════════════════════════════════════ -->
+
+    <model name="aruco_face_10">
+      <static>true</static>
+      <pose>0.40 1.644 0.05 0 0 0</pose>
+      <link name="link">
+        <visual name="vis">
+          <geometry><box><size>0.08 0.001 0.08</size></box></geometry>
+          <material>
+            <script>
+              <uri>model://warden_description/media/materials/scripts/</uri>
+              <uri>model://warden_description/media/materials/textures/</uri>
+              <name>warden_description/aruco_10</name>
+            </script>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <model name="aruco_face_11">
+      <static>true</static>
+      <pose>0.85 1.644 0.05 0 0 0</pose>
+      <link name="link">
+        <visual name="vis">
+          <geometry><box><size>0.08 0.001 0.08</size></box></geometry>
+          <material>
+            <script>
+              <uri>model://warden_description/media/materials/scripts/</uri>
+              <uri>model://warden_description/media/materials/textures/</uri>
+              <name>warden_description/aruco_11</name>
+            </script>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <model name="aruco_face_12">
+      <static>true</static>
+      <pose>1.35 1.644 0.05 0 0 0</pose>
+      <link name="link">
+        <visual name="vis">
+          <geometry><box><size>0.08 0.001 0.08</size></box></geometry>
+          <material>
+            <script>
+              <uri>model://warden_description/media/materials/scripts/</uri>
+              <uri>model://warden_description/media/materials/textures/</uri>
+              <name>warden_description/aruco_12</name>
+            </script>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <model name="aruco_face_13">
+      <static>true</static>
+      <pose>1.60 1.644 0.05 0 0 0</pose>
+      <link name="link">
+        <visual name="vis">
+          <geometry><box><size>0.08 0.001 0.08</size></box></geometry>
+          <material>
+            <script>
+              <uri>model://warden_description/media/materials/scripts/</uri>
+              <uri>model://warden_description/media/materials/textures/</uri>
+              <name>warden_description/aruco_13</name>
+            </script>
           </material>
         </visual>
       </link>
@@ -211,12 +330,12 @@
         </visual>
 
         <sensor name="overhead_camera_sensor" type="camera">
-          <update_rate>30.0</update_rate>
+          <update_rate>20.0</update_rate>
           <camera>
-            <horizontal_fov>1.0472</horizontal_fov>   <!-- 60 degrees -->
+            <horizontal_fov>0.8</horizontal_fov>   <!-- 45.8 degrees — 47px/marker at 3m height -->
             <image>
               <width>640</width>
-              <height>480</height>
+              <height>640</height>
               <format>R8G8B8</format>
             </image>
             <clip>
@@ -233,6 +352,67 @@
             <frame_name>overhead_camera_link</frame_name>
           </plugin>
         </sensor>
+      </link>
+    </model>
+
+    <!-- ════════════════════════════════════════════════════════════════════
+         ARENA PERIMETER WALLS — 2 cm thick, 50 cm tall, with collision.
+         5 m × 5 m boundary centred at (1.0, 1.0) — walls sit 1.5 m outside
+         the 2 m × 2 m play area so Nav2 recovery spins never clip a wall.
+         ════════════════════════════════════════════════════════════════════ -->
+    <model name="wall_south">
+      <static>true</static>
+      <pose>1.0 -1.5 0.25 0 0 0</pose>
+      <link name="link">
+        <collision name="col">
+          <geometry><box><size>5.02 0.02 0.50</size></box></geometry>
+        </collision>
+        <visual name="vis">
+          <geometry><box><size>5.02 0.02 0.50</size></box></geometry>
+          <material><ambient>0.55 0.55 0.55 1</ambient><diffuse>0.55 0.55 0.55 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+
+    <model name="wall_north">
+      <static>true</static>
+      <pose>1.0 3.5 0.25 0 0 0</pose>
+      <link name="link">
+        <collision name="col">
+          <geometry><box><size>5.02 0.02 0.50</size></box></geometry>
+        </collision>
+        <visual name="vis">
+          <geometry><box><size>5.02 0.02 0.50</size></box></geometry>
+          <material><ambient>0.55 0.55 0.55 1</ambient><diffuse>0.55 0.55 0.55 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+
+    <model name="wall_west">
+      <static>true</static>
+      <pose>-1.5 1.0 0.25 0 0 0</pose>
+      <link name="link">
+        <collision name="col">
+          <geometry><box><size>0.02 5.02 0.50</size></box></geometry>
+        </collision>
+        <visual name="vis">
+          <geometry><box><size>0.02 5.02 0.50</size></box></geometry>
+          <material><ambient>0.55 0.55 0.55 1</ambient><diffuse>0.55 0.55 0.55 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+
+    <model name="wall_east">
+      <static>true</static>
+      <pose>3.5 1.0 0.25 0 0 0</pose>
+      <link name="link">
+        <collision name="col">
+          <geometry><box><size>0.02 5.02 0.50</size></box></geometry>
+        </collision>
+        <visual name="vis">
+          <geometry><box><size>0.02 5.02 0.50</size></box></geometry>
+          <material><ambient>0.55 0.55 0.55 1</ambient><diffuse>0.55 0.55 0.55 1</diffuse></material>
+        </visual>
       </link>
     </model>
 
