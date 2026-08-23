@@ -34,7 +34,7 @@ from rclpy.node import Node
 from rclpy.action import ActionClient
 from sensor_msgs.msg import Range
 from std_msgs.msg import String
-from geometry_msgs.msg import PoseWithCovarianceStamped
+from geometry_msgs.msg import PoseWithCovarianceStamped, Twist
 
 try:
     from nav2_msgs.action import NavigateToPose
@@ -59,6 +59,7 @@ class FSM:
     DOCKING         = "DOCKING"
     INSPECTING      = "INSPECTING"
     AWAITING_HUMAN  = "AWAITING_HUMAN"
+    REVIEWING_QUEUE = "REVIEWING_QUEUE"
     REPAIRING       = "REPAIRING"
     RETURNING_HOME  = "RETURNING_HOME"
     MISSION_COMPLETE = "MISSION_COMPLETE"
@@ -71,6 +72,8 @@ class ControlNode(Node):
         # --- publishers ---
         self._cmd_pub    = self.create_publisher(String, "/bot_command",      10)
         self._result_pub = self.create_publisher(String, "/inspection_result", 10)
+        self._state_pub  = self.create_publisher(String, "/fsm_state",         10)
+        self._cmd_vel_pub = self.create_publisher(Twist, "/cmd_vel", 10)
 
         # --- subscribers ---
         self.create_subscription(Range,  "/tof_range",          self._on_tof,      10)
@@ -86,13 +89,17 @@ class ControlNode(Node):
         self._current_box_id = None         # aruco ID of box being inspected
         self._visit_queue    = list(BOX_ARUCO_IDS)   # boxes left to visit
         self._repair_queue   = []            # fault boxes queued for later repair
+        self._is_repair_phase = False        # true when executing queued repairs
+        self._current_repair_batch = []      # list of boxes to repair in current batch
         self._tof_mm         = 9999.0
         self._box_results    = {}            # aruco_id → "FAULT"/"OK"/"REPAIRED"/"SKIP"
 
         # watchdog timer fires every 400 ms; only sends STOP during AWAITING_HUMAN
         self._watchdog_timer = self.create_timer(WATCHDOG_INTERVAL, self._watchdog_tick)
 
-        self._transition(FSM.IDLE)          # auto-advance past SETUP for now (GUI handles SETUP)
+        self._state = FSM.SETUP
+        self._state_pub.publish(String(data=FSM.SETUP))
+        self.get_logger().info("FSM: SETUP — waiting for operator START")
 
     # ------------------------------------------------------------------ FSM
     def _transition(self, new_state: str):
@@ -100,6 +107,7 @@ class ControlNode(Node):
         self._state = new_state
         ts = time.strftime("%H:%M:%S")
         self.get_logger().info(f"[{ts}] FSM: {old} → {new_state}")
+        self._state_pub.publish(String(data=new_state))
 
         if new_state == FSM.IDLE:
             self._maybe_start_next_box()
@@ -122,30 +130,87 @@ class ControlNode(Node):
 
     def _maybe_start_next_box(self):
         """Pick the next unvisited box or finish the mission."""
-        if not self._visit_queue:
-            if self._repair_queue:
-                self.get_logger().info(
-                    f"All boxes visited. Repair queue: {self._repair_queue}"
-                )
-                # GUI will handle REPAIR_QUEUE flow; for now log and complete
-            self._transition(FSM.MISSION_COMPLETE)
+        if self._visit_queue:
+            self._current_box_id = self._visit_queue.pop(0)
+            self.get_logger().info(f"Next target: box ArUco ID {self._current_box_id}")
+            self._transition(FSM.NAVIGATING)
             return
-        self._current_box_id = self._visit_queue.pop(0)
-        self.get_logger().info(f"Next target: box ArUco ID {self._current_box_id}")
-        self._transition(FSM.NAVIGATING)
 
-    # ------------------------------------------------------------------ navigation (stub until Day 7)
+        if self._current_repair_batch:
+            self._is_repair_phase = True
+            self._current_box_id = self._current_repair_batch.pop(0)
+            if self._current_box_id in self._repair_queue:
+                self._repair_queue.remove(self._current_box_id)
+            self.get_logger().info(f"Next target (REPAIR): box ArUco ID {self._current_box_id}")
+            self._transition(FSM.NAVIGATING)
+            return
+
+        if self._repair_queue:
+            self._transition(FSM.REVIEWING_QUEUE)
+            return
+
+        self._transition(FSM.MISSION_COMPLETE)
+
+    # ------------------------------------------------------------------ navigation
     def _navigate_to_current_box(self):
         pos = BOX_POSITIONS.get(self._current_box_id)
-        self.get_logger().info(
-            f"Navigating to box {self._current_box_id} at {pos} "
-            f"(Nav2 not yet active — simulating arrival in 3 s)"
-        )
-        # Simulated travel: real Nav2 goal will replace this on Day 7
-        threading.Timer(3.0, lambda: self._on_nav_arrived()).start()
+        if pos is None:
+            self.get_logger().error(f"No position for box {self._current_box_id}")
+            threading.Timer(1.0, self._on_nav_arrived).start()
+            return
+
+        if HAS_NAV2 and self._nav_client.wait_for_server(timeout_sec=1.0):
+            # Pre-docking stop point: 20 cm south of the box
+            # (all boxes are near the north wall, bot approaches from south)
+            from nav2_msgs.action import NavigateToPose
+            from geometry_msgs.msg import PoseStamped
+            import math as _m
+
+            goal_msg = NavigateToPose.Goal()
+            goal_msg.pose = PoseStamped()
+            goal_msg.pose.header.frame_id = "map"
+            goal_msg.pose.header.stamp    = self.get_clock().now().to_msg()
+            goal_msg.pose.pose.position.x = pos[0]
+            # Extra 10 cm keeps the bot centre outside the costmap inflation zone
+            goal_msg.pose.pose.position.y = pos[1] - (DOCKING_PHASE_CM / 100.0) - 0.10
+            # Face north (+Y) to approach the box
+            goal_msg.pose.pose.orientation.z = _m.sin(_m.pi / 4)
+            goal_msg.pose.pose.orientation.w = _m.cos(_m.pi / 4)
+
+            self.get_logger().info(
+                f"Nav2 goal → box {self._current_box_id} pre-dock at "
+                f"({goal_msg.pose.pose.position.x:.2f}, "
+                f"{goal_msg.pose.pose.position.y:.2f})"
+            )
+            future = self._nav_client.send_goal_async(goal_msg)
+            future.add_done_callback(self._on_nav_goal_response)
+        else:
+            self.get_logger().info(
+                f"Nav2 unavailable — simulating 3 s travel to box {self._current_box_id}"
+            )
+            threading.Timer(3.0, self._on_nav_arrived).start()
+
+    def _on_nav_goal_response(self, future):
+        handle = future.result()
+        if not handle.accepted:
+            self.get_logger().error("Nav2 rejected goal — falling back to timer")
+            threading.Timer(3.0, self._on_nav_arrived).start()
+            return
+        handle.get_result_async().add_done_callback(self._on_nav_result)
+
+    def _on_nav_result(self, future):
+        from action_msgs.msg import GoalStatus
+        status = future.result().status
+        if status == GoalStatus.STATUS_SUCCEEDED:
+            self.get_logger().info("Nav2 goal reached")
+            self._on_nav_arrived()
+        else:
+            self.get_logger().warn(
+                f"Nav2 goal failed (status {status}) — bot near target, proceeding to dock"
+            )
+            self._on_nav_arrived()
 
     def _on_nav_arrived(self):
-        """Called when Nav2 goal succeeds (or simulated timer fires)."""
         if self._state == FSM.NAVIGATING:
             self._transition(FSM.DOCKING)
 
@@ -154,14 +219,23 @@ class ControlNode(Node):
         self.get_logger().info(
             f"Docking: TOF-guided approach. Stop at {DOCKING_STOP_MM} mm."
         )
-        # TOF callbacks drive the transition to INSPECTING
+        # Forward movement is driven by TOF callbacks until stop threshold
 
     def _on_tof(self, msg: Range):
         self._tof_mm = msg.range * 1000.0
         if self._state == FSM.DOCKING:
+            twist = Twist()
             if self._tof_mm <= DOCKING_STOP_MM:
+                twist.linear.x = 0.0
+                self._cmd_vel_pub.publish(twist)
                 self._send_cmd("STOP")
-                self._transition(FSM.INSPECTING)
+                if self._is_repair_phase:
+                    self._transition(FSM.REPAIRING)
+                else:
+                    self._transition(FSM.INSPECTING)
+            else:
+                twist.linear.x = 0.05
+                self._cmd_vel_pub.publish(twist)
 
     # ------------------------------------------------------------------ inspection
     def _start_inspection(self):
@@ -192,19 +266,37 @@ class ControlNode(Node):
 
     # ------------------------------------------------------------------ operator
     def _on_decision(self, msg: String):
-        if self._state != FSM.AWAITING_HUMAN:
-            return
         decision = msg.data.strip().upper()
         self.get_logger().info(f"Operator decision: {decision}")
+
+        if decision == "START" and self._state == FSM.SETUP:
+            self._transition(FSM.IDLE)
+            return
+
+        if decision.startswith("REPAIR_ORDER:"):
+            if self._state != FSM.REVIEWING_QUEUE:
+                return
+            order_str = decision.split(":")[1]
+            if order_str == "NONE" or not order_str:
+                self._transition(FSM.MISSION_COMPLETE)
+            else:
+                self._current_repair_batch = [int(x) for x in order_str.split(",")]
+                self._transition(FSM.IDLE)
+            return
+
+        if self._state != FSM.AWAITING_HUMAN:
+            return
 
         if decision == "REPAIR_NOW":
             self._transition(FSM.REPAIRING)
         elif decision == "QUEUE":
             self._repair_queue.append(self._current_box_id)
             self._box_results[self._current_box_id] = "QUEUED"
+            self._result_pub.publish(String(data=f"QUEUED:{self._current_box_id}"))
             self._transition(FSM.IDLE)
         elif decision == "SKIP":
             self._box_results[self._current_box_id] = "SKIPPED"
+            self._result_pub.publish(String(data=f"SKIPPED:{self._current_box_id}"))
             self._transition(FSM.IDLE)
 
     def _on_status(self, msg: String):
@@ -237,7 +329,8 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     node.destroy_node()
-    rclpy.shutdown()
+    if rclpy.ok():
+        rclpy.shutdown()
 
 
 if __name__ == "__main__":

@@ -47,7 +47,7 @@ def repair_sequence():
 
 threading.Thread(target=send_loop, daemon=True).start()
 
-print("mock_bot: sending TOF:150 @ 10 Hz and ODOM @ 20 Hz")
+print("mock_bot: sending TOF:80 @ 10 Hz and ODOM @ 20 Hz")
 print("mock_bot: waiting for commands (SCAN / REPAIR_MODE / STOP)…\n")
 
 try:
