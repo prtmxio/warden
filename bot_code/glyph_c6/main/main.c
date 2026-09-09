@@ -1,0 +1,798 @@
+/*
+ * Glyph-C6 firmware — Day 5g: full FreeRTOS task set
+ *
+ * Tasks: motor, udp_rx, encoder, tof, watchdog, repair
+ * Console on USB Serial/JTAG; GPIO16/17 free for LEDC.
+ * VL53L0X on I2C0 (SDA=GPIO6, SCL=GPIO7), continuous mode.
+ * SCADA IP learned dynamically from first UDP packet received.
+ * Watchdog stops motors if no UDP for 500 ms.
+ * REPAIR_MODE triggers forward drive → indicator → reverse → STATUS:REPAIRED.
+ */
+
+#include <string.h>
+#include <stdlib.h>
+#include <errno.h>
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/event_groups.h"
+#include "freertos/queue.h"
+
+#include "esp_log.h"
+#include "esp_event.h"
+#include "esp_wifi.h"
+#include "esp_attr.h"
+#include "esp_timer.h"
+#include "nvs_flash.h"
+#include "driver/gpio.h"
+#include "driver/ledc.h"
+#include "driver/i2c_master.h"
+
+#include "lwip/sockets.h"
+#include "lwip/netdb.h"
+
+/* ── Hardware / network constants ──────────────────────────────────────── */
+
+#define WIFI_SSID        "kafka"
+#define WIFI_PASS        "kafka000"
+#define WIFI_MAX_RETRY   10
+
+#define BOT_UDP_PORT     4210
+#define SCADA_UDP_PORT   4211
+
+#define RX_BUF_SIZE      256
+
+/* ── TB6612FNG pin assignments ──────────────────────────────────────────── */
+
+#define PIN_STBY   GPIO_NUM_3
+#define PIN_AIN1   GPIO_NUM_8
+#define PIN_AIN2   GPIO_NUM_9
+#define PIN_BIN1   GPIO_NUM_19
+#define PIN_BIN2   GPIO_NUM_20
+#define PIN_PWMA   GPIO_NUM_16   /* left speed  — LEDC ch0 */
+#define PIN_PWMB   GPIO_NUM_17   /* right speed — LEDC ch1 */
+
+#define LEDC_TIMER     LEDC_TIMER_0
+#define LEDC_MODE      LEDC_LOW_SPEED_MODE
+#define LEDC_CH_LEFT   LEDC_CHANNEL_0
+#define LEDC_CH_RIGHT  LEDC_CHANNEL_1
+#define LEDC_FREQ_HZ   20000
+#define LEDC_DUTY_BITS LEDC_TIMER_8_BIT
+
+typedef struct { int left; int right; } motor_cmd_t;
+static QueueHandle_t s_motor_q;
+
+/* ── Encoder pin assignments ────────────────────────────────────────────── */
+
+#define PIN_ENC_L_C1  GPIO_NUM_21
+#define PIN_ENC_R_C1  GPIO_NUM_14
+
+static volatile int32_t s_left_ticks  = 0;
+static volatile int32_t s_right_ticks = 0;
+
+static void IRAM_ATTR enc_left_isr(void *arg)  { s_left_ticks++;  }
+static void IRAM_ATTR enc_right_isr(void *arg) { s_right_ticks++; }
+
+/* ── VL53L0X I2C config ─────────────────────────────────────────────────── */
+
+#define VL53L0X_ADDR    0x29
+#define PIN_SDA         GPIO_NUM_6
+#define PIN_SCL         GPIO_NUM_7
+#define I2C_SPEED_HZ    10000    /* 10 kHz — safe with 45 kΩ internal pull-ups + any wire capacitance */
+
+/* Two-point linear offset correction based on physical measurements.
+ * Recalibrate if the VL53L0X module is swapped. */
+#define TOF_CAL_RAW1  137   /* raw reading at close cal point (mm) */
+#define TOF_CAL_ACT1   36   /* actual distance at close cal point (mm) */
+#define TOF_CAL_RAW2  250   /* raw reading at far cal point (mm) */
+#define TOF_CAL_ACT2  115   /* actual distance at far cal point (mm) */
+
+/* ── Watchdog + repair constants ────────────────────────────────────────── */
+
+#define WATCHDOG_TIMEOUT_MS     500   /* stop motors if no UDP for this long */
+#define REPAIR_FWD_SPEED         90   /* PWM duty for forward drive into box */
+#define REPAIR_FWD_MS          2000   /* drive duration (reed-trigger stub) */
+#define REPAIR_INDICATOR_CYCLES   6   /* blink/buzz count after contact */
+
+/* Shared handles; NULL if sensor failed to init */
+static i2c_master_bus_handle_t s_vl53_bus = NULL;
+static i2c_master_dev_handle_t s_vl53_dev = NULL;
+
+/* ── Internal ───────────────────────────────────────────────────────────── */
+
+static const char *TAG = "glyph_c6";
+
+static EventGroupHandle_t s_wifi_eg;
+#define WIFI_CONNECTED_BIT BIT0
+#define WIFI_FAIL_BIT      BIT1
+
+static int s_retry = 0;
+static int s_sock  = -1;
+
+/*
+ * Outbound SCADA destination — learned dynamically from whoever sends the first
+ * UDP command.  Initialized to "not yet known" (sin_addr = 0); tof_task and
+ * encoder_task skip sending until a packet has been received.
+ */
+static struct sockaddr_in s_scada_addr = {
+    .sin_family      = AF_INET,
+    .sin_addr.s_addr = 0,
+    .sin_port        = htons(SCADA_UDP_PORT),
+};
+static portMUX_TYPE s_scada_mux = portMUX_INITIALIZER_UNLOCKED;
+
+/* Watchdog: ms timestamp of the last received UDP packet (0 = not yet seen) */
+static volatile uint32_t s_last_rx_ms = 0;
+
+/* repair_task handle — udp_rx_task notifies it on REPAIR_MODE */
+static TaskHandle_t s_repair_task_handle = NULL;
+
+/* Set true during repair cycle so the watchdog doesn't override motor commands */
+static volatile bool s_repair_active = false;
+
+/* ── Motor init ─────────────────────────────────────────────────────────── */
+
+static void motors_init(void)
+{
+    gpio_config_t gc = {
+        .pin_bit_mask = (1ULL << PIN_STBY) | (1ULL << PIN_AIN1) | (1ULL << PIN_AIN2)
+                       | (1ULL << PIN_BIN1) | (1ULL << PIN_BIN2),
+        .mode         = GPIO_MODE_OUTPUT,
+        .pull_up_en   = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&gc);
+    gpio_set_level(PIN_STBY, 0);
+    gpio_set_level(PIN_AIN1, 0);
+    gpio_set_level(PIN_AIN2, 0);
+    gpio_set_level(PIN_BIN1, 0);
+    gpio_set_level(PIN_BIN2, 0);
+
+    ledc_timer_config_t lt = {
+        .speed_mode      = LEDC_MODE,
+        .duty_resolution = LEDC_DUTY_BITS,
+        .timer_num       = LEDC_TIMER,
+        .freq_hz         = LEDC_FREQ_HZ,
+        .clk_cfg         = LEDC_AUTO_CLK,
+    };
+    ESP_ERROR_CHECK(ledc_timer_config(&lt));
+
+    ledc_channel_config_t lc = {
+        .speed_mode = LEDC_MODE,
+        .channel    = LEDC_CH_LEFT,
+        .timer_sel  = LEDC_TIMER,
+        .intr_type  = LEDC_INTR_DISABLE,
+        .gpio_num   = PIN_PWMA,
+        .duty       = 0,
+        .hpoint     = 0,
+    };
+    ESP_ERROR_CHECK(ledc_channel_config(&lc));
+    lc.channel  = LEDC_CH_RIGHT;
+    lc.gpio_num = PIN_PWMB;
+    ESP_ERROR_CHECK(ledc_channel_config(&lc));
+
+    gpio_set_level(PIN_STBY, 1);
+    ESP_LOGI(TAG, "motors init done");
+}
+
+static void set_motor_side(gpio_num_t in1, gpio_num_t in2,
+                            ledc_channel_t ch, int speed)
+{
+    int duty = abs(speed);
+    if (duty > 255) duty = 255;
+
+    if (speed > 0) {
+        gpio_set_level(in1, 1);
+        gpio_set_level(in2, 0);
+    } else if (speed < 0) {
+        gpio_set_level(in1, 0);
+        gpio_set_level(in2, 1);
+    } else {
+        gpio_set_level(in1, 1);
+        gpio_set_level(in2, 1);
+    }
+    ledc_set_duty(LEDC_MODE, ch, duty);
+    ledc_update_duty(LEDC_MODE, ch);
+}
+
+/* ── Motor task ─────────────────────────────────────────────────────────── */
+
+static void motor_task(void *arg)
+{
+    motor_cmd_t cmd;
+    while (1) {
+        if (xQueueReceive(s_motor_q, &cmd, portMAX_DELAY) == pdTRUE) {
+            set_motor_side(PIN_AIN1, PIN_AIN2, LEDC_CH_LEFT,  cmd.left);
+            set_motor_side(PIN_BIN1, PIN_BIN2, LEDC_CH_RIGHT, cmd.right);
+        }
+    }
+}
+
+/* ── Encoder init ───────────────────────────────────────────────────────── */
+
+static void encoders_init(void)
+{
+    gpio_config_t gc = {
+        .pin_bit_mask = (1ULL << PIN_ENC_L_C1) | (1ULL << PIN_ENC_R_C1),
+        .mode         = GPIO_MODE_INPUT,
+        .pull_up_en   = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_POSEDGE,
+    };
+    gpio_config(&gc);
+
+    gpio_install_isr_service(0);
+    gpio_isr_handler_add(PIN_ENC_L_C1, enc_left_isr, NULL);
+    gpio_isr_handler_add(PIN_ENC_R_C1, enc_right_isr, NULL);
+
+    ESP_LOGI(TAG, "encoders init done");
+}
+
+/* ── Encoder task ───────────────────────────────────────────────────────── */
+
+static void encoder_task(void *arg)
+{
+    char buf[48];
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(50));
+        if (s_sock < 0) continue;
+
+        struct sockaddr_in scada;
+        taskENTER_CRITICAL(&s_scada_mux);
+        scada = s_scada_addr;
+        taskEXIT_CRITICAL(&s_scada_mux);
+        if (scada.sin_addr.s_addr == 0) continue;   /* no SCADA seen yet */
+
+        int32_t l = s_left_ticks;
+        int32_t r = s_right_ticks;
+        int n = snprintf(buf, sizeof(buf), "ODOM:%d:%d:0\n", (int)l, (int)r);
+        sendto(s_sock, buf, n, 0, (struct sockaddr *)&scada, sizeof(scada));
+    }
+}
+
+/* ── VL53L0X I2C helpers ────────────────────────────────────────────────── */
+
+static esp_err_t vl53_write(uint8_t reg, uint8_t val)
+{
+    uint8_t buf[2] = {reg, val};
+    return i2c_master_transmit(s_vl53_dev, buf, 2, 50);
+}
+
+static esp_err_t vl53_read(uint8_t reg, uint8_t *val)
+{
+    return i2c_master_transmit_receive(s_vl53_dev, &reg, 1, val, 1, 50);
+}
+
+static esp_err_t vl53_read16(uint8_t reg, uint16_t *val)
+{
+    uint8_t buf[2] = {0, 0};
+    esp_err_t ret = i2c_master_transmit_receive(s_vl53_dev, &reg, 1, buf, 2, 50);
+    *val = ((uint16_t)buf[0] << 8) | buf[1];
+    return ret;
+}
+
+/* ── VL53L0X reference calibration ─────────────────────────────────────── */
+/*
+ * Single-shot calibration measurement required twice before continuous mode:
+ *   vhv_init_byte = 0x40  →  VHV cal  (SYSRANGE_START = 0x41)
+ *   vhv_init_byte = 0x00  →  Phase cal (SYSRANGE_START = 0x01)
+ * Without both, comparator thresholds and timing offsets are uninitialised
+ * and every measurement returns 8190 (no-target sentinel).
+ */
+static void vl53_perform_ref_calibration(uint8_t vhv_init_byte)
+{
+    vl53_write(0x00, 0x01 | vhv_init_byte);
+
+    uint8_t status = 0;
+    for (int i = 0; i < 200; i++) {
+        vl53_read(0x13, &status);
+        if (status & 0x07) break;
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+    if (!(status & 0x07)) {
+        ESP_LOGW(TAG, "VL53L0X ref cal timeout (init_byte=0x%02X)", vhv_init_byte);
+    }
+
+    vl53_write(0x0B, 0x01);   /* clear interrupt */
+    vl53_write(0x00, 0x00);   /* stop single shot */
+}
+
+/* ── VL53L0X init ───────────────────────────────────────────────────────── */
+/*
+ * Mandatory register sequence derived from ST VL53L0X API.
+ * stop_var is device-specific and must be read then written back during the
+ * continuous-ranging start sequence — it calibrates the internal stop condition.
+ */
+static esp_err_t vl53l0x_init(void)
+{
+    /*
+     * GPIO6/GPIO7 are shared with the ESP32-C6 LP I2C peripheral. The LP
+     * subsystem touches these pins during ROM boot, leaving the HP I2C FSM in
+     * a non-IDLE state.  gpio_reset_pin() disconnects them from LP before the
+     * HP I2C master claims them.
+     */
+    gpio_reset_pin(PIN_SDA);
+    gpio_reset_pin(PIN_SCL);
+    vTaskDelay(pdMS_TO_TICKS(5));
+
+    /* --- I2C bus + device --- */
+    i2c_master_bus_config_t bus_cfg = {
+        .clk_source             = I2C_CLK_SRC_DEFAULT,
+        .i2c_port               = I2C_NUM_0,
+        .scl_io_num             = PIN_SCL,
+        .sda_io_num             = PIN_SDA,
+        .glitch_ignore_cnt      = 7,
+        .flags.enable_internal_pullup = true,
+    };
+    esp_err_t ret = i2c_new_master_bus(&bus_cfg, &s_vl53_bus);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "I2C bus init failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    i2c_device_config_t dev_cfg = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address  = VL53L0X_ADDR,
+        .scl_speed_hz    = I2C_SPEED_HZ,
+    };
+    ret = i2c_master_bus_add_device(s_vl53_bus, &dev_cfg, &s_vl53_dev);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "I2C device add failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    /* HW_CLR_BUS toggles SCL 9× to unlock any stuck slave and resets the FSM */
+    i2c_master_bus_reset(s_vl53_bus);
+    vTaskDelay(pdMS_TO_TICKS(10));   /* VL53L0X boot time ≤ 1.2 ms, 10 ms is generous */
+
+    /* Probe first — gives a clean error if the sensor is physically absent */
+    ret = i2c_master_probe(s_vl53_bus, VL53L0X_ADDR, 50);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "VL53L0X not found on I2C bus (probe): %s — check SDA/SCL wiring and sensor power",
+                 esp_err_to_name(ret));
+        s_vl53_dev = NULL;
+        return ret;
+    }
+
+    /* --- Verify model ID --- */
+    uint8_t id = 0;
+    ret = vl53_read(0xC0, &id);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "VL53L0X ID read failed: %s (check pull-ups on SDA/SCL)", esp_err_to_name(ret));
+        s_vl53_dev = NULL;
+        return ret;
+    }
+    if (id != 0xEE) {
+        ESP_LOGE(TAG, "VL53L0X not found (ID=0x%02X, expected 0xEE)", id);
+        s_vl53_dev = NULL;
+        return ESP_FAIL;
+    }
+    ESP_LOGI(TAG, "VL53L0X ID OK (0xEE)");
+
+    /* --- Mandatory tuning settings (from ST API init sequence) --- */
+    vl53_write(0x88, 0x00);
+
+    vl53_write(0x80, 0x01);
+    vl53_write(0xFF, 0x01);
+    vl53_write(0x00, 0x00);
+    uint8_t stop_var = 0;
+    vl53_read(0x91, &stop_var);
+    vl53_write(0x00, 0x01);
+    vl53_write(0xFF, 0x00);
+    vl53_write(0x80, 0x00);
+
+    uint8_t msrc = 0;
+    vl53_read(0x60, &msrc);
+    vl53_write(0x60, msrc | 0x12);   /* disable MSRC + PRE_RANGE signal rate checks */
+    vl53_write(0xFF, 0x01);
+    vl53_write(0x4E, 0x2C);
+    vl53_write(0x48, 0x00);
+    vl53_write(0x30, 0x20);
+    vl53_write(0xFF, 0x00);
+    vl53_write(0x30, 0x09);
+    vl53_write(0x54, 0x10);
+    vl53_write(0x31, 0x04);
+    vl53_write(0x32, 0x03);
+    vl53_write(0x40, 0x83);
+    vl53_write(0x46, 0x25);
+    vl53_write(0x60, 0x00);
+    vl53_write(0x27, 0x00);
+    vl53_write(0x50, 0x06);
+    vl53_write(0x51, 0x00);
+    vl53_write(0x52, 0x96);
+    vl53_write(0x56, 0x08);
+    vl53_write(0x57, 0x30);
+    vl53_write(0x61, 0x00);
+    vl53_write(0x62, 0x00);
+    vl53_write(0x64, 0x00);
+    vl53_write(0x65, 0x00);
+    vl53_write(0x66, 0xA0);
+
+    vl53_write(0xFF, 0x01);
+    vl53_write(0x22, 0x32);
+    vl53_write(0x47, 0x14);
+    vl53_write(0x49, 0xFF);
+    vl53_write(0x4A, 0x00);
+
+    vl53_write(0xFF, 0x00);
+    vl53_write(0x7A, 0x0A);
+    vl53_write(0x7B, 0x00);
+    vl53_write(0x78, 0x21);
+
+    vl53_write(0xFF, 0x01);
+    vl53_write(0x23, 0x34);
+    vl53_write(0x42, 0x00);
+    vl53_write(0x44, 0xFF);
+    vl53_write(0x45, 0x26);
+    vl53_write(0x46, 0x05);
+    vl53_write(0x40, 0x40);
+    vl53_write(0x0E, 0x06);
+    vl53_write(0x20, 0x1A);
+    vl53_write(0x43, 0x40);
+
+    vl53_write(0xFF, 0x00);
+    vl53_write(0x34, 0x03);
+    vl53_write(0x35, 0x44);
+
+    vl53_write(0xFF, 0x01);
+    vl53_write(0x31, 0x04);
+    vl53_write(0x4B, 0x09);
+    vl53_write(0x4C, 0x05);
+    vl53_write(0x4D, 0x04);
+
+    vl53_write(0xFF, 0x00);
+    vl53_write(0x44, 0x00);
+    vl53_write(0x45, 0x20);
+    vl53_write(0x47, 0x08);
+    vl53_write(0x48, 0x28);
+    vl53_write(0x67, 0x00);
+    vl53_write(0x70, 0x04);
+    vl53_write(0x71, 0x01);
+    vl53_write(0x72, 0xFE);
+    vl53_write(0x76, 0x00);
+    vl53_write(0x77, 0x00);
+
+    vl53_write(0xFF, 0x01);
+    vl53_write(0x0D, 0x01);
+
+    vl53_write(0xFF, 0x00);
+    vl53_write(0x80, 0x01);
+    vl53_write(0x01, 0xF8);
+
+    vl53_write(0xFF, 0x01);
+    vl53_write(0x8E, 0x01);
+    vl53_write(0x00, 0x01);
+    vl53_write(0xFF, 0x00);
+    vl53_write(0x80, 0x00);
+
+    /* GPIO: interrupt when new sample is ready */
+    vl53_write(0x0A, 0x04);
+    vl53_write(0x0B, 0x01);   /* clear any pending interrupt */
+
+    /* VHV calibration — loads comparator thresholds from factory NVM */
+    vl53_write(0x01, 0x01);               /* SYSTEM_SEQUENCE_CONFIG: TCC step only */
+    vl53_perform_ref_calibration(0x40);
+
+    /* Phase calibration — sets return-signal timing offsets */
+    vl53_write(0x01, 0x02);               /* SYSTEM_SEQUENCE_CONFIG: DSS step only */
+    vl53_perform_ref_calibration(0x00);
+
+    /* Restore normal sequence steps for continuous ranging */
+    vl53_write(0x01, 0xE8);
+
+    /* Start continuous back-to-back ranging */
+    vl53_write(0x80, 0x01);
+    vl53_write(0xFF, 0x01);
+    vl53_write(0x00, 0x00);
+    vl53_write(0x91, stop_var);
+    vl53_write(0x00, 0x01);
+    vl53_write(0xFF, 0x00);
+    vl53_write(0x80, 0x00);
+    vl53_write(0x00, 0x02);   /* SYSRANGE_START: continuous mode */
+
+    ESP_LOGI(TAG, "VL53L0X init done — continuous ranging started");
+    return ESP_OK;
+}
+
+/* ── TOF calibration correction ─────────────────────────────────────────── */
+
+static uint16_t tof_correct(uint16_t raw)
+{
+    if (raw >= 8000) return 2000;  /* cap no-target at 2000 mm */
+    float slope = (float)(TOF_CAL_ACT2 - TOF_CAL_ACT1)
+                / (float)(TOF_CAL_RAW2 - TOF_CAL_RAW1);
+    float c = slope * ((float)raw - TOF_CAL_RAW1) + TOF_CAL_ACT1;
+    return (c > 0.0f) ? (uint16_t)(c + 0.5f) : 0;
+}
+
+/* ── TOF task ───────────────────────────────────────────────────────────── */
+/*
+ * Polls the sensor interrupt status (~33 ms measurement period), reads the
+ * 16-bit range result at register 0x1E, then sends TOF:<mm>\n to SCADA.
+ * 2000 mm is emitted when the sensor reports no target (raw >= 8000).
+ */
+static void tof_task(void *arg)
+{
+    char buf[24];
+
+    while (1) {
+        /* Poll RESULT_INTERRUPT_STATUS (0x13) bits[2:0] — non-zero = ready */
+        uint8_t status  = 0;
+        uint8_t retries = 0;
+        do {
+            vl53_read(0x13, &status);
+            if (status & 0x07) break;
+            vTaskDelay(pdMS_TO_TICKS(2));
+        } while (++retries < 50);   /* max ~100 ms wait */
+
+        uint16_t range_mm = 8190;
+        if (status & 0x07) {
+            vl53_read16(0x1E, &range_mm);
+            vl53_write(0x0B, 0x01);   /* clear interrupt so next reading is fresh */
+            range_mm = tof_correct(range_mm);
+        }
+
+        if (s_sock < 0) continue;
+
+        struct sockaddr_in scada;
+        taskENTER_CRITICAL(&s_scada_mux);
+        scada = s_scada_addr;
+        taskEXIT_CRITICAL(&s_scada_mux);
+        if (scada.sin_addr.s_addr == 0) continue;   /* no SCADA seen yet */
+
+        int n = snprintf(buf, sizeof(buf), "TOF:%d\n", (int)range_mm);
+        sendto(s_sock, buf, n, 0, (struct sockaddr *)&scada, sizeof(scada));
+    }
+}
+
+/* ── Wi-Fi event handler ────────────────────────────────────────────────── */
+
+static void wifi_event_handler(void *arg, esp_event_base_t base,
+                               int32_t id, void *data)
+{
+    if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+    } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
+        if (s_retry < WIFI_MAX_RETRY) {
+            esp_wifi_connect();
+            s_retry++;
+            ESP_LOGI(TAG, "retrying Wi-Fi (%d/%d)", s_retry, WIFI_MAX_RETRY);
+        } else {
+            xEventGroupSetBits(s_wifi_eg, WIFI_FAIL_BIT);
+            ESP_LOGE(TAG, "Wi-Fi failed after %d retries", WIFI_MAX_RETRY);
+        }
+    } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t *ev = (ip_event_got_ip_t *)data;
+        ESP_LOGI(TAG, "IP: " IPSTR, IP2STR(&ev->ip_info.ip));
+        s_retry = 0;
+        xEventGroupSetBits(s_wifi_eg, WIFI_CONNECTED_BIT);
+    }
+}
+
+/* ── Wi-Fi init ─────────────────────────────────────────────────────────── */
+
+static void wifi_init_sta(void)
+{
+    s_wifi_eg = xEventGroupCreate();
+
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_netif_create_default_wifi_sta();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(
+        WIFI_EVENT, ESP_EVENT_ANY_ID,  wifi_event_handler, NULL, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(
+        IP_EVENT,   IP_EVENT_STA_GOT_IP, wifi_event_handler, NULL, NULL));
+
+    wifi_config_t wcfg = {
+        .sta = {
+            .ssid     = WIFI_SSID,
+            .password = WIFI_PASS,
+            .threshold.authmode = WIFI_AUTH_WPA2_PSK,
+        },
+    };
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wcfg));
+    ESP_ERROR_CHECK(esp_wifi_start());
+    /* Reduce peak RF current to avoid BOD on USB-only power */
+    ESP_ERROR_CHECK(esp_wifi_set_max_tx_power(40));
+
+    EventBits_t bits = xEventGroupWaitBits(s_wifi_eg,
+        WIFI_CONNECTED_BIT | WIFI_FAIL_BIT, pdFALSE, pdFALSE, portMAX_DELAY);
+
+    if (bits & WIFI_CONNECTED_BIT) {
+        ESP_LOGI(TAG, "Wi-Fi connected to SSID: %s", WIFI_SSID);
+    } else {
+        ESP_LOGE(TAG, "Wi-Fi connection failed — check SSID/password");
+    }
+}
+
+/* ── UDP socket init ────────────────────────────────────────────────────── */
+
+static void udp_socket_init(void)
+{
+    s_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (s_sock < 0) {
+        ESP_LOGE(TAG, "socket() failed: %d", errno);
+        return;
+    }
+
+    struct sockaddr_in bind_addr = {
+        .sin_family      = AF_INET,
+        .sin_addr.s_addr = htonl(INADDR_ANY),
+        .sin_port        = htons(BOT_UDP_PORT),
+    };
+    if (bind(s_sock, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) < 0) {
+        ESP_LOGE(TAG, "bind() failed: %d", errno);
+        close(s_sock);
+        s_sock = -1;
+        return;
+    }
+    ESP_LOGI(TAG, "UDP socket bound on port %d", BOT_UDP_PORT);
+}
+
+/* ── UDP RX task ────────────────────────────────────────────────────────── */
+
+static void udp_rx_task(void *arg)
+{
+    static char rx_buf[RX_BUF_SIZE];
+    struct sockaddr_in sender;
+    socklen_t sender_len = sizeof(sender);
+    motor_cmd_t cmd = {0, 0};
+
+    ESP_LOGI(TAG, "udp_rx_task started — listening on port %d", BOT_UDP_PORT);
+
+    while (1) {
+        int n = recvfrom(s_sock, rx_buf, sizeof(rx_buf) - 1, 0,
+                         (struct sockaddr *)&sender, &sender_len);
+        if (n < 0) {
+            ESP_LOGE(TAG, "recvfrom error: %d", errno);
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
+        rx_buf[n] = '\0';
+        ESP_LOGI(TAG, "RX(%d): %s", n, rx_buf);
+
+        /* Update SCADA destination and reset watchdog timer */
+        taskENTER_CRITICAL(&s_scada_mux);
+        s_scada_addr.sin_addr = sender.sin_addr;
+        taskEXIT_CRITICAL(&s_scada_mux);
+        s_last_rx_ms = (uint32_t)(esp_timer_get_time() / 1000);
+
+        if (strncmp(rx_buf, "LEFT:", 5) == 0) {
+            int l = 0, r = 0;
+            char *p = strstr(rx_buf, "RIGHT:");
+            l = atoi(rx_buf + 5);
+            if (p) r = atoi(p + 6);
+            cmd.left  = l;
+            cmd.right = r;
+            xQueueOverwrite(s_motor_q, &cmd);
+        } else if (strncmp(rx_buf, "STOP", 4) == 0) {
+            cmd.left = 0;
+            cmd.right = 0;
+            xQueueOverwrite(s_motor_q, &cmd);
+            ESP_LOGI(TAG, "STOP");
+        } else if (strcmp(rx_buf, "REPAIR_MODE") == 0) {
+            if (s_repair_task_handle) {
+                xTaskNotifyGive(s_repair_task_handle);
+            }
+        } else if (strcmp(rx_buf, "SCAN") == 0) {
+            ESP_LOGI(TAG, "SCAN received (S3 UART forward not yet wired)");
+        } else {
+            sendto(s_sock, rx_buf, n, 0,
+                   (struct sockaddr *)&sender, sender_len);
+        }
+    }
+}
+
+/* ── Watchdog task ──────────────────────────────────────────────────────── */
+
+static void watchdog_task(void *arg)
+{
+    motor_cmd_t stop = {0, 0};
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+        if (s_last_rx_ms == 0) continue;   /* not yet connected */
+        uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+        if (!s_repair_active && (now - s_last_rx_ms) > WATCHDOG_TIMEOUT_MS) {
+            xQueueOverwrite(s_motor_q, &stop);
+        }
+    }
+}
+
+/* ── Repair task ────────────────────────────────────────────────────────── */
+/*
+ * Waits indefinitely for a task notification (sent by udp_rx_task on
+ * REPAIR_MODE).  Runs one full repair cycle per notification.
+ *
+ * Reed-trigger stub: drives forward for REPAIR_FWD_MS then stops.
+ * When 5f (reed ISR) is added, replace the fixed delay with a loop that
+ * exits on s_reed_triggered or the timeout, and record actual elapsed ms
+ * to use as the reverse duration.
+ */
+static void repair_task(void *arg)
+{
+    motor_cmd_t cmd;
+    motor_cmd_t stop = {0, 0};
+
+    while (1) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        s_repair_active = true;
+
+        /* Drive forward */
+        cmd.left  = REPAIR_FWD_SPEED;
+        cmd.right = REPAIR_FWD_SPEED;
+        xQueueOverwrite(s_motor_q, &cmd);
+        vTaskDelay(pdMS_TO_TICKS(REPAIR_FWD_MS));
+        xQueueOverwrite(s_motor_q, &stop);
+
+        /* Indicator: 6 cycles (log only — LED/buzzer GPIO wired in Day 6) */
+        for (int i = 0; i < REPAIR_INDICATOR_CYCLES; i++) {
+            ESP_LOGI(TAG, "INDICATOR cycle %d/%d", i + 1, REPAIR_INDICATOR_CYCLES);
+            vTaskDelay(pdMS_TO_TICKS(200));
+        }
+
+        /* Reverse */
+        cmd.left  = -REPAIR_FWD_SPEED;
+        cmd.right = -REPAIR_FWD_SPEED;
+        xQueueOverwrite(s_motor_q, &cmd);
+        vTaskDelay(pdMS_TO_TICKS(REPAIR_FWD_MS));
+        xQueueOverwrite(s_motor_q, &stop);
+
+        /* Notify SCADA */
+        struct sockaddr_in scada;
+        taskENTER_CRITICAL(&s_scada_mux);
+        scada = s_scada_addr;
+        taskEXIT_CRITICAL(&s_scada_mux);
+        if (scada.sin_addr.s_addr != 0) {
+            const char *msg = "STATUS:REPAIRED\n";
+            sendto(s_sock, msg, strlen(msg), 0,
+                   (struct sockaddr *)&scada, sizeof(scada));
+        }
+        s_repair_active = false;
+        ESP_LOGI(TAG, "Repair cycle complete — STATUS:REPAIRED sent");
+    }
+}
+
+/* ── Entry point ────────────────────────────────────────────────────────── */
+
+void app_main(void)
+{
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+
+    ESP_LOGI(TAG, "=== Glyph-C6 booting ===");
+
+    s_motor_q = xQueueCreate(1, sizeof(motor_cmd_t));
+    motors_init();
+    encoders_init();
+
+    /* VL53L0X init runs before Wi-Fi so failures are visible immediately */
+    vl53l0x_init();
+
+    wifi_init_sta();
+    udp_socket_init();
+
+    xTaskCreate(motor_task,   "motor",   2048, NULL, 6, NULL);
+    xTaskCreate(udp_rx_task,  "udp_rx",  4096, NULL, 5, NULL);
+    xTaskCreate(encoder_task, "encoder", 2048, NULL, 4, NULL);
+
+    if (s_vl53_dev != NULL) {
+        xTaskCreate(tof_task, "tof", 2048, NULL, 3, NULL);
+    } else {
+        ESP_LOGW(TAG, "TOF task not started — VL53L0X not detected");
+    }
+
+    xTaskCreate(watchdog_task, "watchdog", 1024, NULL, 7, NULL);
+    xTaskCreate(repair_task,   "repair",   2048, NULL, 5, &s_repair_task_handle);
+
+    ESP_LOGI(TAG, "All tasks started — ready");
+}
