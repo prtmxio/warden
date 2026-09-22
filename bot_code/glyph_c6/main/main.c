@@ -552,6 +552,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
                                int32_t id, void *data)
 {
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
+        esp_wifi_set_max_tx_power(40);   /* limit before first probe burst */
         esp_wifi_connect();
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         if (s_retry < WIFI_MAX_RETRY) {
@@ -598,8 +599,6 @@ static void wifi_init_sta(void)
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wcfg));
     ESP_ERROR_CHECK(esp_wifi_start());
-    /* Reduce peak RF current to avoid BOD on USB-only power */
-    ESP_ERROR_CHECK(esp_wifi_set_max_tx_power(40));
 
     EventBits_t bits = xEventGroupWaitBits(s_wifi_eg,
         WIFI_CONNECTED_BIT | WIFI_FAIL_BIT, pdFALSE, pdFALSE, portMAX_DELAY);
