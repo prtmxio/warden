@@ -27,6 +27,7 @@
 #include "driver/gpio.h"
 #include "driver/ledc.h"
 #include "driver/i2c_master.h"
+#include "driver/uart.h"
 
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
@@ -680,7 +681,8 @@ static void udp_rx_task(void *arg)
                 xTaskNotifyGive(s_repair_task_handle);
             }
         } else if (strcmp(rx_buf, "SCAN") == 0) {
-            ESP_LOGI(TAG, "SCAN received (S3 UART forward not yet wired)");
+            uart_write_bytes(UART_NUM_1, "SCAN\n", 5);
+            ESP_LOGI(TAG, "SCAN forwarded to S3");
         } else {
             sendto(s_sock, rx_buf, n, 0,
                    (struct sockaddr *)&sender, sender_len);
@@ -779,6 +781,19 @@ void app_main(void)
 
     wifi_init_sta();
     udp_socket_init();
+
+    /* UART1 TX → S3 GPIO2: forwards SCAN command */
+    uart_config_t uart_cfg = {
+        .baud_rate  = 115200,
+        .data_bits  = UART_DATA_8_BITS,
+        .parity     = UART_PARITY_DISABLE,
+        .stop_bits  = UART_STOP_BITS_1,
+        .flow_ctrl  = UART_HW_FLOWCTRL_DISABLE,
+    };
+    ESP_ERROR_CHECK(uart_driver_install(UART_NUM_1, 256, 0, 0, NULL, 0));
+    ESP_ERROR_CHECK(uart_param_config(UART_NUM_1, &uart_cfg));
+    ESP_ERROR_CHECK(uart_set_pin(UART_NUM_1, GPIO_NUM_4, UART_PIN_NO_CHANGE,
+                                 UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
 
     xTaskCreate(motor_task,   "motor",   2048, NULL, 6, NULL);
     xTaskCreate(udp_rx_task,  "udp_rx",  4096, NULL, 5, NULL);
