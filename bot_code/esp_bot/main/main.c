@@ -1,12 +1,21 @@
 /*
- * Glyph-C6 firmware — Day 5g: full FreeRTOS task set
+ * Bot firmware — running on ESP32-S3 (replaces Glyph-C6)
  *
  * Tasks: motor, udp_rx, encoder, tof, watchdog, repair
- * Console on USB Serial/JTAG; GPIO16/17 free for LEDC.
+ * Console on USB Serial/JTAG (USB-CDC on S3).
  * VL53L0X on I2C0 (SDA=GPIO6, SCL=GPIO7), continuous mode.
  * SCADA IP learned dynamically from first UDP packet received.
  * Watchdog stops motors if no UDP for 500 ms.
  * REPAIR_MODE triggers forward drive → indicator → reverse → STATUS:REPAIRED.
+ *
+ * Pin changes from C6 → S3:
+ *   STBY:  GPIO3  → GPIO4   (GPIO3 is strapping pin on S3)
+ *   BIN1:  GPIO19 → GPIO40  (GPIO19 = USB D− on S3)
+ *   BIN2:  GPIO20 → GPIO41  (GPIO20 = USB D+ on S3)
+ *   PWMA:  GPIO16 → GPIO38  (GPIO16/17 = PSRAM on N16R8)
+ *   PWMB:  GPIO17 → GPIO39
+ *   ENC_L: GPIO22 → GPIO12  (GPIO22 not exposed on DevKitC-1)
+ *   UART1: GPIO4  → GPIO2   (GPIO4 now used for STBY)
  */
 
 #include <string.h>
@@ -45,13 +54,13 @@
 
 /* ── TB6612FNG pin assignments ──────────────────────────────────────────── */
 
-#define PIN_STBY   GPIO_NUM_3
+#define PIN_STBY   GPIO_NUM_4
 #define PIN_AIN1   GPIO_NUM_8
 #define PIN_AIN2   GPIO_NUM_9
-#define PIN_BIN1   GPIO_NUM_19
-#define PIN_BIN2   GPIO_NUM_20
-#define PIN_PWMA   GPIO_NUM_16   /* left speed  — LEDC ch0 */
-#define PIN_PWMB   GPIO_NUM_17   /* right speed — LEDC ch1 */
+#define PIN_BIN1   GPIO_NUM_40
+#define PIN_BIN2   GPIO_NUM_41
+#define PIN_PWMA   GPIO_NUM_38   /* left speed  — LEDC ch0 */
+#define PIN_PWMB   GPIO_NUM_39   /* right speed — LEDC ch1 */
 
 #define LEDC_TIMER     LEDC_TIMER_0
 #define LEDC_MODE      LEDC_LOW_SPEED_MODE
@@ -66,7 +75,9 @@ static QueueHandle_t s_motor_q;
 /* ── Encoder pin assignments ────────────────────────────────────────────── */
 
 #define PIN_ENC_L_C1  GPIO_NUM_21
-#define PIN_ENC_R_C1  GPIO_NUM_14
+#define PIN_ENC_L_C2  GPIO_NUM_12
+#define PIN_ENC_R_C1  GPIO_NUM_18
+#define PIN_ENC_R_C2  GPIO_NUM_15
 
 static volatile int32_t s_left_ticks  = 0;
 static volatile int32_t s_right_ticks = 0;
@@ -101,7 +112,7 @@ static i2c_master_dev_handle_t s_vl53_dev = NULL;
 
 /* ── Internal ───────────────────────────────────────────────────────────── */
 
-static const char *TAG = "glyph_c6";
+static const char *TAG = "bot_s3";
 
 static EventGroupHandle_t s_wifi_eg;
 #define WIFI_CONNECTED_BIT BIT0
@@ -307,12 +318,7 @@ static void vl53_perform_ref_calibration(uint8_t vhv_init_byte)
  */
 static esp_err_t vl53l0x_init(void)
 {
-    /*
-     * GPIO6/GPIO7 are shared with the ESP32-C6 LP I2C peripheral. The LP
-     * subsystem touches these pins during ROM boot, leaving the HP I2C FSM in
-     * a non-IDLE state.  gpio_reset_pin() disconnects them from LP before the
-     * HP I2C master claims them.
-     */
+    /* Reset pins before claiming them for I2C to ensure a clean bus state. */
     gpio_reset_pin(PIN_SDA);
     gpio_reset_pin(PIN_SCL);
     vTaskDelay(pdMS_TO_TICKS(5));
@@ -770,7 +776,7 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
 
-    ESP_LOGI(TAG, "=== Glyph-C6 booting ===");
+    ESP_LOGI(TAG, "=== Bot S3 (control) booting ===");
 
     s_motor_q = xQueueCreate(1, sizeof(motor_cmd_t));
     motors_init();
@@ -782,7 +788,7 @@ void app_main(void)
     wifi_init_sta();
     udp_socket_init();
 
-    /* UART1 TX → S3 GPIO2: forwards SCAN command */
+    /* UART1 TX on GPIO2 → camera S3 UART RX: forwards SCAN command */
     uart_config_t uart_cfg = {
         .baud_rate  = 115200,
         .data_bits  = UART_DATA_8_BITS,
@@ -792,7 +798,7 @@ void app_main(void)
     };
     ESP_ERROR_CHECK(uart_driver_install(UART_NUM_1, 256, 0, 0, NULL, 0));
     ESP_ERROR_CHECK(uart_param_config(UART_NUM_1, &uart_cfg));
-    ESP_ERROR_CHECK(uart_set_pin(UART_NUM_1, GPIO_NUM_4, UART_PIN_NO_CHANGE,
+    ESP_ERROR_CHECK(uart_set_pin(UART_NUM_1, GPIO_NUM_2, UART_PIN_NO_CHANGE,
                                  UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
 
     xTaskCreate(motor_task,   "motor",   2048, NULL, 6, NULL);
