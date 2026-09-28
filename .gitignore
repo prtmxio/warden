@@ -24,6 +24,9 @@ log/
 *.world.backup
 /sim/urdf/meshes/*.stl     # regenerated from Onshape tool, not hand-edited
 
+# ── ESP-IDF clangd index (IDE artifact, regenerated automatically) ─
+bot_code/**/.cache/
+
 # ── Arduino / ESP32 ───────────────────────────────────────────────
 bot_code/**/*.elf
 bot_code/**/*.bin
