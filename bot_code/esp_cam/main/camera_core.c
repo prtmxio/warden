@@ -2,6 +2,8 @@
 #include "esp_log.h"
 #include "esp_camera.h"
 #include "sensor.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include <string.h>
 
 static const char *TAG = "CAM_CORE";
@@ -54,9 +56,9 @@ esp_err_t camera_core_init(void)
         .ledc_timer   = LEDC_TIMER_0,
         .ledc_channel = LEDC_CHANNEL_0,
 
-        .pixel_format = PIXFORMAT_JPEG,
-        .frame_size   = FRAMESIZE_VGA,
-        .jpeg_quality = 12,
+        /* GC2145 has no hardware JPEG encoder — capture YUV422, encode to JPEG in software */
+        .pixel_format = PIXFORMAT_YUV422,
+        .frame_size   = FRAMESIZE_QVGA,
         .fb_count     = 2,
         .fb_location  = CAMERA_FB_IN_PSRAM,
         .grab_mode    = CAMERA_GRAB_LATEST,
@@ -68,8 +70,23 @@ esp_err_t camera_core_init(void)
         return err;
     }
 
+    /* GC2145 needs a short settle after init before ISP registers are stable */
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    sensor_t *s = esp_camera_sensor_get();
+    if (s) {
+        s->set_exposure_ctrl(s, 1);
+        s->set_gain_ctrl(s, 1);
+        s->set_whitebal(s, 1);
+        s->set_brightness(s, 0);
+        s->set_contrast(s, 0);
+        s->set_saturation(s, 0);
+        s->set_hmirror(s, 0);
+        s->set_vflip(s, 0);
+    }
+
     s_is_initialized = true;
-    ESP_LOGI(TAG, "Camera initialized (QVGA JPEG PSRAM)");
+    ESP_LOGI(TAG, "Camera initialized (QVGA YUV422 PSRAM)");
     return ESP_OK;
 }
 

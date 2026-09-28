@@ -22,6 +22,7 @@
 #include "esp_camera.h"
 
 #include "camera_core.h"
+#include "img_converters.h"
 
 /* ── Network constants ──────────────────────────────────────────────────── */
 
@@ -121,18 +122,30 @@ static esp_err_t stream_handler(httpd_req_t *req)
             break;
         }
 
+        /* GC2145 outputs YUV422 — encode to JPEG in software before sending */
+        uint8_t *jpg_buf = NULL;
+        size_t   jpg_len = 0;
+        bool ok = frame2jpg(fb, 80, &jpg_buf, &jpg_len);
+        esp_camera_fb_return(fb);   /* return framebuffer before the slow HTTP send */
+
+        if (!ok) {
+            ESP_LOGE(TAG, "JPEG encode failed");
+            res = ESP_FAIL;
+            break;
+        }
+
         char hdr[80];
         int hdr_len = snprintf(hdr, sizeof(hdr),
             "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %zu\r\n\r\n",
-            fb->len);
+            jpg_len);
 
         res = httpd_resp_send_chunk(req, hdr, hdr_len);
         if (res == ESP_OK)
-            res = httpd_resp_send_chunk(req, (char *)fb->buf, fb->len);
+            res = httpd_resp_send_chunk(req, (char *)jpg_buf, jpg_len);
         if (res == ESP_OK)
             res = httpd_resp_send_chunk(req, "\r\n", 2);
 
-        esp_camera_fb_return(fb);
+        free(jpg_buf);
 
         if (res != ESP_OK) break;   /* client disconnected */
     }
