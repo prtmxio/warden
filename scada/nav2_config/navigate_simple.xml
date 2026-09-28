@@ -1,7 +1,7 @@
 <?xml version="1.0"?>
 <root main_tree_to_execute="MainTree">
   <BehaviorTree ID="MainTree">
-    <RecoveryNode number_of_retries="3" name="NavigateRecovery">
+    <RecoveryNode number_of_retries="1" name="NavigateRecovery">
       <PipelineSequence name="NavigateWithReplanning">
         <RateController hz="1.0">
           <ComputePathToPose goal="{goal}" path="{path}" planner_id="GridBased"/>
@@ -10,7 +10,7 @@
       </PipelineSequence>
       <Sequence name="RecoveryFallback">
         <BackUp backup_dist="0.20" backup_speed="0.06"/>
-        <Spin spin_dist="1.57"/>
+        <Spin spin_dist="0.785"/>
         <ClearEntireCostmap
           service_name="/global_costmap/clear_entirely_global_costmap"/>
         <ClearEntireCostmap

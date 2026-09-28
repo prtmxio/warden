@@ -5,36 +5,36 @@ Replaces udp_bridge_node + mock_bot + physical sensors for sim runs.
 
 Publishes:
   /map           OccupancyGrid  — static arena with walls + box footprints
-  /tof_range     Range          — geometric distance from bot to box face during DOCKING;
-                                  999 mm (far) in all other states
+  /tof_range     Range          — geometric distance from bot to box face during the
+                                  approach/inspect states; 999 mm (far) in all other states
   /bot_status    String         — STATUS:REPAIRED after repair sequence
   /cmd_vel       Twist          — backward motion for 2 s after repair (simulates firmware
                                   reed-triggered reversal)
 
 Subscribes:
-  /fsm_state     String         — to know when DOCKING / REPAIRING starts
+  /fsm_state     String         — to know when the bot is approaching / REPAIRING
   /bot_command   String         — REPAIR_MODE → STATUS:REPAIRED after 2s + reversal
-  /tof_sensor/depth_sensor/depth/image_raw  Image — real simulated depth sensor
+  /odom          Odometry       — bot pose (odom≡map) for the geometric TOF beam
 
-Note: /robot_pose is owned by sim_vision_node (real ArUco detection).
+Note: /robot_pose is owned by sim_vision_node (real ArUco detection). The Gazebo depth
+sensor stays in the world for visualization but is no longer used for range — a narrow-beam
+VL53L0X is synthesised geometrically from /odom + box positions (robust to sensor mounting).
 """
 
 import math
 import sys
 import threading
 
-import numpy as np
-
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
 from std_msgs.msg import String
-from sensor_msgs.msg import Range, Image
-from nav_msgs.msg import OccupancyGrid
+from sensor_msgs.msg import Range
+from nav_msgs.msg import OccupancyGrid, Odometry
 from geometry_msgs.msg import Twist
 
 sys.path.insert(0, "/home/xio/Desktop/warden/scada")
-from arena_config import BOX_POSITIONS, BOX_ARUCO_IDS, ARENA_SIZE_CM, DOCKING_STOP_MM
+from arena_config import BOX_POSITIONS, BOX_ARUCO_IDS, ARENA_SIZE_CM
 
 # Arena is ARENA_SIZE_CM × ARENA_SIZE_CM, resolution 5 cm/cell
 _RES   = 0.05           # m per cell
@@ -42,7 +42,13 @@ _COLS  = int(ARENA_SIZE_CM / 100.0 / _RES) + 2   # +2 for walls
 _ROWS  = _COLS
 _ORIG  = -_RES          # origin so cell (1,1) = (0,0) in world
 
-FAKE_TOF_FAR_MM = 999.0   # reported outside DOCKING state
+FAKE_TOF_FAR_MM = 999.0   # reported outside the approach/inspect states
+
+# Narrow-beam VL53L0X emulation: the physical sensor sits this far ahead of the odom
+# origin (TOF_joint x in warden.urdf.xacro); box south face is BOX_HALF south of centre.
+SENSOR_OFFSET = 0.20      # m — sensor forward of base_footprint/odom origin
+BOX_HALF      = 0.05      # m — half a 10 cm box cube
+_TOF_STATES   = ("APPROACH_SCAN", "APPROACH_DOCK", "INSPECTING")
 
 
 def _build_arena_map() -> list:
@@ -88,12 +94,11 @@ class SimInspectionNode(Node):
 
         self.create_subscription(String,   "/fsm_state",   self._on_fsm,  10)
         self.create_subscription(String,   "/bot_command", self._on_cmd,  10)
-        
-        # Real simulated depth sensor!
-        self.create_subscription(Image, "/tof_sensor/depth_sensor/depth/image_raw", self._on_depth, 10)
+        # Bot pose (odom≡map) to synthesise a narrow-beam TOF geometrically
+        self.create_subscription(Odometry, "/odom",        self._on_odom, 10)
 
         self._fsm_state  = "SETUP"
-        self._tof_m      = FAKE_TOF_FAR_MM / 1000.0
+        self._bot        = None          # (x, y, yaw) from /odom, or None
         self._reverse_ticks = 0         # >0 while post-repair reversal is active
 
         self._map_data = _build_arena_map()
@@ -102,7 +107,7 @@ class SimInspectionNode(Node):
         self.create_timer(0.10, self._reverse_tick)  # drives post-repair reversal
 
         self._pub_map()
-        self.get_logger().info("sim_inspection_node ready — real simulated TOF active")
+        self.get_logger().info("sim_inspection_node ready — geometric TOF active")
 
     # ── map ──────────────────────────────────────────────────────────────────
 
@@ -119,33 +124,32 @@ class SimInspectionNode(Node):
         msg.data = self._map_data
         self._map_pub.publish(msg)
         
-    # ── Depth Sensor parsing ──────────────────────────────────────────────────
-    
-    def _on_depth(self, msg: Image):
-        if self._fsm_state != "DOCKING":
-            self._tof_m = FAKE_TOF_FAR_MM / 1000.0
-            return
+    # ── pose ───────────────────────────────────────────────────────────────────
 
-        try:
-            if msg.encoding == '32FC1':
-                arr = np.frombuffer(bytes(msg.data), dtype=np.float32).reshape(msg.height, msg.width)
-                valid = arr[(arr > 0.05) & np.isfinite(arr) & (arr < 5.0)]
-            elif msg.encoding == '16UC1':
-                raw = np.frombuffer(bytes(msg.data), dtype=np.uint16).reshape(msg.height, msg.width)
-                arr = raw.astype(np.float32) / 1000.0
-                valid = arr[(raw > 0) & (arr > 0.05) & (arr < 5.0)]
-            else:
-                self._tof_m = FAKE_TOF_FAR_MM / 1000.0
-                return
-
-            self._tof_m = float(valid.min()) if len(valid) > 0 else FAKE_TOF_FAR_MM / 1000.0
-        except Exception as e:
-            self.get_logger().error(f"Error parsing depth image: {e}")
-            self._tof_m = FAKE_TOF_FAR_MM / 1000.0
+    def _on_odom(self, msg: Odometry):
+        q = msg.pose.pose.orientation
+        yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y),
+                         1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+        self._bot = (msg.pose.pose.position.x, msg.pose.pose.position.y, yaw)
 
     # ── TOF ───────────────────────────────────────────────────────────────────
 
+    def _geometric_tof_m(self) -> float:
+        """Narrow-beam range from the forward-mounted sensor to the south face of the box
+        the bot is lined up with (all boxes on the north wall, approached facing +Y)."""
+        if self._bot is None:
+            return FAKE_TOF_FAR_MM / 1000.0
+        x, y, yaw = self._bot
+        sx = x + SENSOR_OFFSET * math.cos(yaw)
+        sy = y + SENSOR_OFFSET * math.sin(yaw)
+        # Pick the box the bot is most laterally aligned with, measure the forward gap to its face
+        bx, by = min(BOX_POSITIONS.values(), key=lambda p: abs(sx - p[0]))
+        return max(0.0, (by - BOX_HALF) - sy)
+
     def _pub_tof(self):
+        tof_m = (self._geometric_tof_m()
+                 if self._fsm_state in _TOF_STATES
+                 else FAKE_TOF_FAR_MM / 1000.0)
         msg = Range()
         msg.header.stamp      = self.get_clock().now().to_msg()
         msg.header.frame_id   = "tof_sensor"
@@ -153,7 +157,7 @@ class SimInspectionNode(Node):
         msg.field_of_view     = 0.1
         msg.min_range         = 0.05
         msg.max_range         = 5.0
-        msg.range             = self._tof_m
+        msg.range             = tof_m
         self._tof_pub.publish(msg)
 
     # ── FSM state changes ─────────────────────────────────────────────────────

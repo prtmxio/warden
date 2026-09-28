@@ -4,10 +4,12 @@ control_node — mission FSM + Nav2 action client.
 States (in order):
   SETUP           → operator configures box positions in GUI
   IDLE            → waiting for START RUN
-  NAVIGATING      → Nav2 driving to next box
-  DOCKING         → TOF-guided final approach (<DOCKING_PHASE_CM)
-  INSPECTING      → bot_cam scanning box side marker
+  NAVIGATING      → Nav2 driving to the pre-dock standoff south of the box
+  ALIGNING        → rotate in place to perpendicular (face the box, ±PERP_TOL_DEG)
+  APPROACH_SCAN   → TOF-guided straight creep to SCAN_STOP_MM, then read the ArUco
+  INSPECTING      → resolve verdict (gated on square-on, full-QR view)
   AWAITING_HUMAN  → fault detected, waiting for operator decision
+  APPROACH_DOCK   → TOF-guided straight creep to DOCK_STOP_MM before repairing
   REPAIRING       → bot executing physical repair sequence
   RETURNING_HOME  → Nav2 driving back to start pose
   MISSION_COMPLETE
@@ -16,7 +18,7 @@ Subscribes:
   /tof_range          Range
   /bot_status         String   (STATUS:REPAIRED, STATUS:REED, …)
   /operator_decision  String   (REPAIR_NOW / QUEUE / SKIP)
-  /robot_pose         PoseWithCovarianceStamped  (not used until Day 7)
+  /odom               Odometry (closed-loop align/approach heading, odom≡map frame)
 
 Publishes:
   /bot_command        String   (SCAN / REPAIR_MODE / STOP)
@@ -26,6 +28,7 @@ Watchdog: publishes STOP to /bot_command every 400 ms while in AWAITING_HUMAN.
 """
 
 import sys
+import math
 import time
 import threading
 
@@ -34,7 +37,8 @@ from rclpy.node import Node
 from rclpy.action import ActionClient
 from sensor_msgs.msg import Range
 from std_msgs.msg import String
-from geometry_msgs.msg import PoseWithCovarianceStamped, Twist
+from nav_msgs.msg import Odometry
+from geometry_msgs.msg import Twist
 
 try:
     from nav2_msgs.action import NavigateToPose
@@ -45,18 +49,45 @@ except ImportError:
 sys.path.insert(0, "/home/xio/Desktop/warden/scada")
 from arena_config import (
     BOX_ARUCO_IDS, BOX_POSITIONS, fault_config,
-    DOCKING_STOP_MM, DOCKING_PHASE_CM,
+    SCAN_STOP_MM, DOCK_STOP_MM, NAV_STANDOFF_M,
+    PERP_TOL_DEG, LATERAL_TOL_M, APPROACH_SPEED,
+    APPROACH_YAW_KP, ALIGN_YAW_KP,
+    CAM_FWD, CAM_LAT, AXLE_FWD, AXLE_LAT,
     WATCHDOG_MS,
 )
 
 WATCHDOG_INTERVAL = WATCHDOG_MS / 1000.0 * 0.8   # send STOP slightly faster than 500 ms
+
+# Boxes line the north wall and are always approached from the south, so the perpendicular
+# (full-view) heading is a constant: face +Y.
+TARGET_YAW = math.pi / 2.0
+
+
+def _wrap(a: float) -> float:
+    """Wrap an angle to (-π, π]."""
+    return math.atan2(math.sin(a), math.cos(a))
+
+
+def _camera_x(x: float, yaw: float) -> float:
+    """World-x of the S3 camera for a base pose (x, yaw). base_footprint is off the bot
+    centerline, so this — not base_x — is what must line up with the box centre."""
+    return x + CAM_FWD * math.cos(yaw) - CAM_LAT * math.sin(yaw)
+
+
+def _axle_x(x: float, yaw: float) -> float:
+    """World-x of the wheel-axle midpoint (the in-place rotation centre). Centering this on the
+    box is rotation-invariant, so the perp-turn doesn't move it — and since the camera is on the
+    same centerline, the camera lands centred once perpendicular."""
+    return x + AXLE_FWD * math.cos(yaw) - AXLE_LAT * math.sin(yaw)
 
 
 class FSM:
     SETUP           = "SETUP"
     IDLE            = "IDLE"
     NAVIGATING      = "NAVIGATING"
-    DOCKING         = "DOCKING"
+    ALIGNING        = "ALIGNING"        # rotate in place to perpendicular
+    APPROACH_SCAN   = "APPROACH_SCAN"   # TOF creep to scan distance, then read ArUco
+    APPROACH_DOCK   = "APPROACH_DOCK"   # TOF creep to dock distance, then repair
     INSPECTING      = "INSPECTING"
     AWAITING_HUMAN  = "AWAITING_HUMAN"
     REVIEWING_QUEUE = "REVIEWING_QUEUE"
@@ -79,6 +110,9 @@ class ControlNode(Node):
         self.create_subscription(Range,  "/tof_range",          self._on_tof,      10)
         self.create_subscription(String, "/bot_status",         self._on_status,   10)
         self.create_subscription(String, "/operator_decision",  self._on_decision, 10)
+        # Closed-loop align/approach runs in the odom≡map frame (same frame Nav2 and /cmd_vel
+        # use). /robot_pose (overhead ArUco) is uncalibrated relative to it, so use /odom here.
+        self.create_subscription(Odometry, "/odom", self._on_odom, 10)
 
         # Nav2 action client (only wired up from Day 7 onward)
         if HAS_NAV2:
@@ -93,6 +127,11 @@ class ControlNode(Node):
         self._current_repair_batch = []      # list of boxes to repair in current batch
         self._tof_mm         = 9999.0
         self._box_results    = {}            # aruco_id → "FAULT"/"OK"/"REPAIRED"/"SKIP"
+        self._pose           = None          # (x, y, yaw) from /odom, or None
+        self._align_timer    = None          # active only during ALIGNING
+        self._align_phase    = "center_turn" # center_turn → center_drive → perp_turn
+        self._align_ok_count = 0             # consecutive in-tolerance perp ticks
+        self._inspect_retries = 0            # failed full-view reads for current box
 
         # watchdog timer fires every 400 ms; only sends STOP during AWAITING_HUMAN
         self._watchdog_timer = self.create_timer(WATCHDOG_INTERVAL, self._watchdog_tick)
@@ -115,8 +154,14 @@ class ControlNode(Node):
         elif new_state == FSM.NAVIGATING:
             self._navigate_to_current_box()
 
-        elif new_state == FSM.DOCKING:
-            self._start_docking()
+        elif new_state == FSM.ALIGNING:
+            self._start_align()
+
+        elif new_state == FSM.APPROACH_SCAN:
+            self.get_logger().info(f"Approach-scan: TOF creep to {SCAN_STOP_MM:.0f} mm")
+
+        elif new_state == FSM.APPROACH_DOCK:
+            self.get_logger().info(f"Approach-dock: TOF creep to {DOCK_STOP_MM:.0f} mm")
 
         elif new_state == FSM.INSPECTING:
             self._start_inspection()
@@ -171,8 +216,8 @@ class ControlNode(Node):
             goal_msg.pose.header.frame_id = "map"
             goal_msg.pose.header.stamp    = self.get_clock().now().to_msg()
             goal_msg.pose.pose.position.x = pos[0]
-            # Extra 10 cm keeps the bot centre outside the costmap inflation zone
-            goal_msg.pose.pose.position.y = pos[1] - (DOCKING_PHASE_CM / 100.0) - 0.10
+            # Pre-dock standoff south of the box; control_node fine-aligns + creeps from here
+            goal_msg.pose.pose.position.y = pos[1] - NAV_STANDOFF_M
             # Face north (+Y) to approach the box
             goal_msg.pose.pose.orientation.z = _m.sin(_m.pi / 4)
             goal_msg.pose.pose.orientation.w = _m.cos(_m.pi / 4)
@@ -212,30 +257,120 @@ class ControlNode(Node):
 
     def _on_nav_arrived(self):
         if self._state == FSM.NAVIGATING:
-            self._transition(FSM.DOCKING)
+            self._transition(FSM.ALIGNING)
 
-    # ------------------------------------------------------------------ docking
-    def _start_docking(self):
-        self.get_logger().info(
-            f"Docking: TOF-guided approach. Stop at {DOCKING_STOP_MM} mm."
+    # ------------------------------------------------------------------ pose
+    def _on_odom(self, msg: Odometry):
+        q = msg.pose.pose.orientation
+        yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y),
+                         1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+        self._pose = (
+            msg.pose.pose.position.x,
+            msg.pose.pose.position.y,
+            _wrap(yaw),
         )
-        # Forward movement is driven by TOF callbacks until stop threshold
 
+    # ------------------------------------------------------------------ alignment
+    def _start_align(self):
+        """Center the wheel-axle (rotation centre) on the box centerline, then face the box.
+        Centering the axle — not base_footprint — makes the camera land centred and is
+        rotation-invariant, so the final perp-turn doesn't push it back off."""
+        self._stop_align_timer()   # guard against a stale timer on retry
+        self._align_ok_count = 0
+        pos = BOX_POSITIONS.get(self._current_box_id)
+        need_center = (self._pose is not None and pos is not None
+                       and abs(pos[0] - _axle_x(self._pose[0], self._pose[2])) > LATERAL_TOL_M)
+        self._align_phase = "center_turn" if need_center else "perp_turn"
+        self.get_logger().info(
+            f"Aligning (phase={self._align_phase}, target ±{PERP_TOL_DEG:.1f}°)"
+        )
+        self._align_timer = self.create_timer(0.05, self._align_tick)   # 20 Hz
+
+    def _align_tick(self):
+        if self._state != FSM.ALIGNING:
+            self._stop_align_timer()
+            return
+        if self._pose is None:
+            return
+        pos = BOX_POSITIONS.get(self._current_box_id)
+        if pos is None:
+            return
+
+        x, _, yaw = self._pose
+        e_axle = pos[0] - _axle_x(x, yaw)   # +ve → box centre is east (+x) of the axle
+        twist = Twist()
+
+        if self._align_phase == "center_turn":
+            if abs(e_axle) <= LATERAL_TOL_M:
+                self._align_phase = "perp_turn"
+                return
+            # Face along the centerline correction direction (east or west)
+            target = 0.0 if e_axle > 0 else math.pi
+            err = _wrap(target - yaw)
+            if abs(err) <= math.radians(2.0):
+                self._align_phase = "center_drive"
+            else:
+                twist.angular.z = max(-0.8, min(0.8, ALIGN_YAW_KP * err))
+                self._cmd_vel_pub.publish(twist)
+            return
+
+        if self._align_phase == "center_drive":
+            # Driving forward while facing east/west shrinks the axle's lateral offset
+            if abs(e_axle) <= 0.01:
+                self._cmd_vel_pub.publish(twist)   # stop
+                self._align_phase = "perp_turn"
+            else:
+                twist.linear.x = APPROACH_SPEED
+                self._cmd_vel_pub.publish(twist)
+            return
+
+        # perp_turn — rotates about the axle, so the centered axle_x is preserved
+        err = _wrap(TARGET_YAW - yaw)
+        if abs(err) <= math.radians(PERP_TOL_DEG):
+            self._align_ok_count += 1
+        else:
+            self._align_ok_count = 0
+        if self._align_ok_count >= 5:          # hold in-tolerance before committing
+            self._cmd_vel_pub.publish(twist)   # stop
+            self._stop_align_timer()
+            # Repair pass skips inspection and docks straight in; scan pass reads first
+            if self._is_repair_phase:
+                self._transition(FSM.APPROACH_DOCK)
+            else:
+                self._transition(FSM.APPROACH_SCAN)
+            return
+        twist.angular.z = max(-0.6, min(0.6, ALIGN_YAW_KP * err))
+        self._cmd_vel_pub.publish(twist)
+
+    def _stop_align_timer(self):
+        if self._align_timer is not None:
+            self._align_timer.cancel()
+            self.destroy_timer(self._align_timer)
+            self._align_timer = None
+
+    # ------------------------------------------------------------------ approach
     def _on_tof(self, msg: Range):
         self._tof_mm = msg.range * 1000.0
-        if self._state == FSM.DOCKING:
-            twist = Twist()
-            if self._tof_mm <= DOCKING_STOP_MM:
-                twist.linear.x = 0.0
-                self._cmd_vel_pub.publish(twist)
-                self._send_cmd("STOP")
-                if self._is_repair_phase:
-                    self._transition(FSM.REPAIRING)
-                else:
-                    self._transition(FSM.INSPECTING)
+        if self._state not in (FSM.APPROACH_SCAN, FSM.APPROACH_DOCK):
+            return
+
+        target_mm = SCAN_STOP_MM if self._state == FSM.APPROACH_SCAN else DOCK_STOP_MM
+        twist = Twist()
+        if self._tof_mm <= target_mm:
+            self._cmd_vel_pub.publish(twist)   # stop
+            self._send_cmd("STOP")
+            if self._state == FSM.APPROACH_SCAN:
+                self._transition(FSM.INSPECTING)
             else:
-                twist.linear.x = 0.05
-                self._cmd_vel_pub.publish(twist)
+                self._transition(FSM.REPAIRING)
+        else:
+            twist.linear.x = APPROACH_SPEED
+            # Hold perpendicular heading while creeping so the QR stays square-on and centred
+            # (lateral centering was done in ALIGNING via the axle).
+            if self._pose is not None:
+                yaw_err = _wrap(TARGET_YAW - self._pose[2])
+                twist.angular.z = max(-0.3, min(0.3, APPROACH_YAW_KP * yaw_err))
+            self._cmd_vel_pub.publish(twist)
 
     # ------------------------------------------------------------------ inspection
     def _start_inspection(self):
@@ -248,9 +383,53 @@ class ControlNode(Node):
         # For Day 3 mock: resolve immediately from fault_config.
         threading.Timer(1.0, self._sim_inspect_result).start()
 
+    def _scan_view_valid(self) -> bool:
+        """True only if the bot is square-on (±PERP_TOL_DEG), centred on the box
+        (±LATERAL_TOL_M) and within scan range — i.e. the whole QR is readable."""
+        if self._pose is None:
+            return False
+        pos = BOX_POSITIONS.get(self._current_box_id)
+        if pos is None:
+            return False
+        x, _, yaw = self._pose
+        perp_err = abs(_wrap(yaw - TARGET_YAW))
+        lat_err  = abs(_camera_x(x, yaw) - pos[0])   # camera's view, not base_footprint
+        dist_ok  = self._tof_mm <= (SCAN_STOP_MM + 30)
+        ok = (perp_err <= math.radians(PERP_TOL_DEG)
+              and lat_err <= LATERAL_TOL_M
+              and dist_ok)
+        self.get_logger().info(
+            f"view check box {self._current_box_id}: "
+            f"perp={math.degrees(perp_err):.2f}° lat={lat_err*100:.1f}cm "
+            f"dist={self._tof_mm:.0f}mm → {'OK' if ok else 'FAIL'}"
+        )
+        return ok
+
     def _sim_inspect_result(self):
         if self._state != FSM.INSPECTING:
             return
+
+        # Gate the read on geometry: a partial/angled view must not resolve to a verdict
+        if not self._scan_view_valid():
+            self._inspect_retries += 1
+            if self._inspect_retries <= 2:
+                self.get_logger().warn(
+                    f"ArUco unreadable for box {self._current_box_id} "
+                    f"(retry {self._inspect_retries}/2) — re-aligning"
+                )
+                self._transition(FSM.ALIGNING)
+                return
+            # Give up gracefully: treat as OK and keep patrolling (Day-10 convention)
+            self.get_logger().warn(
+                f"ArUco still unreadable for box {self._current_box_id} — treating as OK"
+            )
+            self._inspect_retries = 0
+            self._box_results[self._current_box_id] = "OK"
+            self._result_pub.publish(String(data=f"OK:{self._current_box_id}"))
+            self._transition(FSM.IDLE)
+            return
+
+        self._inspect_retries = 0
         verdict = fault_config.get(self._current_box_id, "OK")
         self.get_logger().info(
             f"Inspection result for box {self._current_box_id}: {verdict}"
@@ -288,7 +467,8 @@ class ControlNode(Node):
             return
 
         if decision == "REPAIR_NOW":
-            self._transition(FSM.REPAIRING)
+            # Bot is at scan distance and already perpendicular — creep in to dock distance
+            self._transition(FSM.APPROACH_DOCK)
         elif decision == "QUEUE":
             self._repair_queue.append(self._current_box_id)
             self._box_results[self._current_box_id] = "QUEUED"
