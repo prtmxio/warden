@@ -29,6 +29,7 @@ import rclpy
 
 sys.path.insert(0, "/home/xio/Desktop/warden/scada")
 
+from bot_cam         import BotCamNode
 from control_node    import ControlNode
 from udp_bridge_node import UdpBridgeNode
 from vision_node     import VisionNode
@@ -56,6 +57,7 @@ def main():
         ControlNode(),
         UdpBridgeNode(),
         VisionNode(),
+        BotCamNode(),
     ]
 
     threads = [

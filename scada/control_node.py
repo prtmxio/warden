@@ -15,10 +15,11 @@ States (in order):
   MISSION_COMPLETE
 
 Subscribes:
-  /tof_range          Range
-  /bot_status         String   (STATUS:REPAIRED, STATUS:REED, …)
-  /operator_decision  String   (REPAIR_NOW / QUEUE / SKIP)
-  /odom               Odometry (closed-loop align/approach heading, odom≡map frame)
+  /tof_range            Range
+  /bot_status           String   (STATUS:REPAIRED, …)
+  /operator_decision    String   (REPAIR_NOW / QUEUE / SKIP)
+  /odom                 Odometry (closed-loop align/approach heading, odom≡map frame)
+  /box_aruco_detected   String   (ArUco ID 10-13 from bot_cam_node)
 
 Publishes:
   /bot_command        String   (SCAN / REPAIR_MODE / STOP)
@@ -107,9 +108,10 @@ class ControlNode(Node):
         self._cmd_vel_pub = self.create_publisher(Twist, "/cmd_vel", 10)
 
         # --- subscribers ---
-        self.create_subscription(Range,  "/tof_range",          self._on_tof,      10)
-        self.create_subscription(String, "/bot_status",         self._on_status,   10)
-        self.create_subscription(String, "/operator_decision",  self._on_decision, 10)
+        self.create_subscription(Range,    "/tof_range",           self._on_tof,          10)
+        self.create_subscription(String,   "/bot_status",          self._on_status,       10)
+        self.create_subscription(String,   "/operator_decision",   self._on_decision,     10)
+        self.create_subscription(String,   "/box_aruco_detected",  self._on_aruco_detected, 10)
         # Closed-loop align/approach runs in the odom≡map frame (same frame Nav2 and /cmd_vel
         # use). /robot_pose (overhead ArUco) is uncalibrated relative to it, so use /odom here.
         self.create_subscription(Odometry, "/odom", self._on_odom, 10)
@@ -132,6 +134,8 @@ class ControlNode(Node):
         self._align_phase    = "center_turn" # center_turn → center_drive → perp_turn
         self._align_ok_count = 0             # consecutive in-tolerance perp ticks
         self._inspect_retries = 0            # failed full-view reads for current box
+        self._inspect_timer  = None          # 5 s timeout waiting for ArUco from bot_cam
+        self._repair_timer   = None          # 2.5 s → sends REPAIR_STOP to firmware
 
         # watchdog timer fires every 400 ms; only sends STOP during AWAITING_HUMAN
         self._watchdog_timer = self.create_timer(WATCHDOG_INTERVAL, self._watchdog_tick)
@@ -168,6 +172,7 @@ class ControlNode(Node):
 
         elif new_state == FSM.REPAIRING:
             self._send_cmd("REPAIR_MODE")
+            self._repair_timer = self.create_timer(2.5, self._send_repair_stop)
 
         elif new_state == FSM.MISSION_COMPLETE:
             self.get_logger().info("=== MISSION COMPLETE ===")
@@ -377,11 +382,47 @@ class ControlNode(Node):
         self._send_cmd("SCAN")
         self.get_logger().info(
             f"SCAN sent for box {self._current_box_id} — "
-            f"waiting for bot_cam result (simulated via fault_config)"
+            f"waiting for ArUco detection from bot_cam (5 s timeout)"
         )
-        # In real flow, bot_cam.py publishes /inspection_result.
-        # For Day 3 mock: resolve immediately from fault_config.
-        threading.Timer(1.0, self._sim_inspect_result).start()
+        self._inspect_timer = self.create_timer(5.0, self._inspect_timeout)
+
+    def _cancel_inspect_timer(self):
+        if self._inspect_timer is not None:
+            self._inspect_timer.cancel()
+            self.destroy_timer(self._inspect_timer)
+            self._inspect_timer = None
+
+    def _on_aruco_detected(self, msg: String):
+        if self._state != FSM.INSPECTING:
+            return
+        try:
+            detected_id = int(msg.data)
+        except ValueError:
+            return
+        if detected_id not in BOX_ARUCO_IDS:
+            return
+        self._cancel_inspect_timer()
+        self._resolve_inspection(detected_id)
+
+    def _inspect_timeout(self):
+        self._cancel_inspect_timer()
+        if self._state != FSM.INSPECTING:
+            return
+        self._inspect_retries += 1
+        if self._inspect_retries <= 2:
+            self.get_logger().warn(
+                f"ArUco timeout for box {self._current_box_id} "
+                f"(retry {self._inspect_retries}/2) — re-aligning"
+            )
+            self._transition(FSM.ALIGNING)
+            return
+        self.get_logger().warn(
+            f"ArUco still not detected for box {self._current_box_id} — treating as OK"
+        )
+        self._inspect_retries = 0
+        self._box_results[self._current_box_id] = "OK"
+        self._result_pub.publish(String(data=f"OK:{self._current_box_id}"))
+        self._transition(FSM.IDLE)
 
     def _scan_view_valid(self) -> bool:
         """True only if the bot is square-on (±PERP_TOL_DEG), centred on the box
@@ -405,23 +446,22 @@ class ControlNode(Node):
         )
         return ok
 
-    def _sim_inspect_result(self):
+    def _resolve_inspection(self, detected_id: int):
         if self._state != FSM.INSPECTING:
             return
 
-        # Gate the read on geometry: a partial/angled view must not resolve to a verdict
+        # Gate on geometry: a partial/angled view must not resolve to a verdict
         if not self._scan_view_valid():
             self._inspect_retries += 1
             if self._inspect_retries <= 2:
                 self.get_logger().warn(
-                    f"ArUco unreadable for box {self._current_box_id} "
-                    f"(retry {self._inspect_retries}/2) — re-aligning"
+                    f"ArUco ID {detected_id} seen but view geometry invalid for box "
+                    f"{self._current_box_id} (retry {self._inspect_retries}/2) — re-aligning"
                 )
                 self._transition(FSM.ALIGNING)
                 return
-            # Give up gracefully: treat as OK and keep patrolling (Day-10 convention)
             self.get_logger().warn(
-                f"ArUco still unreadable for box {self._current_box_id} — treating as OK"
+                f"View geometry still invalid for box {self._current_box_id} — treating as OK"
             )
             self._inspect_retries = 0
             self._box_results[self._current_box_id] = "OK"
@@ -430,9 +470,10 @@ class ControlNode(Node):
             return
 
         self._inspect_retries = 0
-        verdict = fault_config.get(self._current_box_id, "OK")
+        verdict = fault_config.get(detected_id, "OK")
         self.get_logger().info(
-            f"Inspection result for box {self._current_box_id}: {verdict}"
+            f"Inspection result for box {self._current_box_id} "
+            f"(ArUco ID {detected_id}): {verdict}"
         )
         self._result_pub.publish(String(data=f"{verdict}:{self._current_box_id}"))
         self._box_results[self._current_box_id] = verdict
@@ -440,7 +481,6 @@ class ControlNode(Node):
         if verdict == "FAULT":
             self._transition(FSM.AWAITING_HUMAN)
         else:
-            # OK → go to next box directly
             self._transition(FSM.IDLE)
 
     # ------------------------------------------------------------------ operator
@@ -479,11 +519,23 @@ class ControlNode(Node):
             self._result_pub.publish(String(data=f"SKIPPED:{self._current_box_id}"))
             self._transition(FSM.IDLE)
 
+    def _cancel_repair_timer(self):
+        if self._repair_timer is not None:
+            self._repair_timer.cancel()
+            self.destroy_timer(self._repair_timer)
+            self._repair_timer = None
+
+    def _send_repair_stop(self):
+        self._cancel_repair_timer()
+        if self._state == FSM.REPAIRING:
+            self._send_cmd("REPAIR_STOP")
+
     def _on_status(self, msg: String):
         status = msg.data.strip()
         self.get_logger().info(f"Bot status: {status}")
 
         if status == "STATUS:REPAIRED" and self._state == FSM.REPAIRING:
+            self._cancel_repair_timer()
             self._box_results[self._current_box_id] = "REPAIRED"
             self._result_pub.publish(
                 String(data=f"REPAIRED:{self._current_box_id}")
