@@ -40,6 +40,7 @@
 
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
+#include "mdns.h"
 
 /* ── Hardware / network constants ──────────────────────────────────────── */
 
@@ -103,8 +104,12 @@ static void IRAM_ATTR enc_right_isr(void *arg) { s_right_ticks++; }
 
 #define WATCHDOG_TIMEOUT_MS     500   /* stop motors if no UDP for this long */
 #define REPAIR_FWD_SPEED         90   /* PWM duty for forward drive into box */
-#define REPAIR_FWD_MS          2000   /* drive duration (reed-trigger stub) */
-#define REPAIR_INDICATOR_CYCLES   6   /* blink/buzz count after contact */
+#define REPAIR_FWD_SAFETY_MS   5000   /* hard timeout if SCADA never sends REPAIR_STOP */
+#define REPAIR_INDICATOR_CYCLES   6   /* LED blink count after contact */
+
+/* ── Indicator LED ──────────────────────────────────────────────────────── */
+
+#define PIN_LED  GPIO_NUM_47
 
 /* Shared handles; NULL if sensor failed to init */
 static i2c_master_bus_handle_t s_vl53_bus = NULL;
@@ -141,6 +146,9 @@ static TaskHandle_t s_repair_task_handle = NULL;
 
 /* Set true during repair cycle so the watchdog doesn't override motor commands */
 static volatile bool s_repair_active = false;
+
+/* Set true by udp_rx_task on "REPAIR_STOP"; ends the forward drive in repair_task */
+static volatile bool s_repair_stop = false;
 
 /* ── Motor init ─────────────────────────────────────────────────────────── */
 
@@ -686,6 +694,9 @@ static void udp_rx_task(void *arg)
             if (s_repair_task_handle) {
                 xTaskNotifyGive(s_repair_task_handle);
             }
+        } else if (strcmp(rx_buf, "REPAIR_STOP") == 0) {
+            s_repair_stop = true;
+            ESP_LOGI(TAG, "REPAIR_STOP received");
         } else if (strcmp(rx_buf, "SCAN") == 0) {
             uart_write_bytes(UART_NUM_1, "SCAN\n", 5);
             ESP_LOGI(TAG, "SCAN forwarded to S3");
@@ -713,13 +724,10 @@ static void watchdog_task(void *arg)
 
 /* ── Repair task ────────────────────────────────────────────────────────── */
 /*
- * Waits indefinitely for a task notification (sent by udp_rx_task on
- * REPAIR_MODE).  Runs one full repair cycle per notification.
- *
- * Reed-trigger stub: drives forward for REPAIR_FWD_MS then stops.
- * When 5f (reed ISR) is added, replace the fixed delay with a loop that
- * exits on s_reed_triggered or the timeout, and record actual elapsed ms
- * to use as the reverse duration.
+ * Waits indefinitely for a task notification (sent by udp_rx_task on REPAIR_MODE).
+ * Drives forward until SCADA sends REPAIR_STOP (or REPAIR_FWD_SAFETY_MS elapses),
+ * records actual forward time, then reverses for the same duration so the bot
+ * returns to its pre-repair position.
  */
 static void repair_task(void *arg)
 {
@@ -729,25 +737,36 @@ static void repair_task(void *arg)
     while (1) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
         s_repair_active = true;
+        s_repair_stop   = false;
 
-        /* Drive forward */
+        /* Drive forward — stop when SCADA sends REPAIR_STOP or safety timeout */
         cmd.left  = REPAIR_FWD_SPEED;
         cmd.right = REPAIR_FWD_SPEED;
         xQueueOverwrite(s_motor_q, &cmd);
-        vTaskDelay(pdMS_TO_TICKS(REPAIR_FWD_MS));
+
+        uint32_t t_start = (uint32_t)(esp_timer_get_time() / 1000);
+        while (!s_repair_stop) {
+            uint32_t elapsed = (uint32_t)(esp_timer_get_time() / 1000) - t_start;
+            if (elapsed >= REPAIR_FWD_SAFETY_MS) break;
+            vTaskDelay(pdMS_TO_TICKS(20));
+        }
+        uint32_t actual_ms = (uint32_t)(esp_timer_get_time() / 1000) - t_start;
+        s_repair_stop = false;
         xQueueOverwrite(s_motor_q, &stop);
 
-        /* Indicator: 6 cycles (log only — LED/buzzer GPIO wired in Day 6) */
+        /* LED indicator: 6 blink cycles */
         for (int i = 0; i < REPAIR_INDICATOR_CYCLES; i++) {
-            ESP_LOGI(TAG, "INDICATOR cycle %d/%d", i + 1, REPAIR_INDICATOR_CYCLES);
+            gpio_set_level(PIN_LED, 1);
+            vTaskDelay(pdMS_TO_TICKS(200));
+            gpio_set_level(PIN_LED, 0);
             vTaskDelay(pdMS_TO_TICKS(200));
         }
 
-        /* Reverse */
+        /* Reverse for the same duration the forward drive took */
         cmd.left  = -REPAIR_FWD_SPEED;
         cmd.right = -REPAIR_FWD_SPEED;
         xQueueOverwrite(s_motor_q, &cmd);
-        vTaskDelay(pdMS_TO_TICKS(REPAIR_FWD_MS));
+        vTaskDelay(pdMS_TO_TICKS(actual_ms));
         xQueueOverwrite(s_motor_q, &stop);
 
         /* Notify SCADA */
@@ -761,7 +780,7 @@ static void repair_task(void *arg)
                    (struct sockaddr *)&scada, sizeof(scada));
         }
         s_repair_active = false;
-        ESP_LOGI(TAG, "Repair cycle complete — STATUS:REPAIRED sent");
+        ESP_LOGI(TAG, "Repair cycle complete — fwd=%lums STATUS:REPAIRED sent", (unsigned long)actual_ms);
     }
 }
 
@@ -782,10 +801,27 @@ void app_main(void)
     motors_init();
     encoders_init();
 
+    /* Indicator LED */
+    gpio_config_t led_cfg = {
+        .pin_bit_mask = (1ULL << PIN_LED),
+        .mode         = GPIO_MODE_OUTPUT,
+        .pull_up_en   = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&led_cfg);
+    gpio_set_level(PIN_LED, 0);
+
     /* VL53L0X init runs before Wi-Fi so failures are visible immediately */
     vl53l0x_init();
 
     wifi_init_sta();
+
+    mdns_init();
+    mdns_hostname_set("esp-bot");
+    mdns_instance_name_set("Warden Bot");
+    ESP_LOGI(TAG, "mDNS started — hostname: esp-bot.local");
+
     udp_socket_init();
 
     /* UART1 TX on GPIO2 → camera S3 UART RX: forwards SCAN command */
