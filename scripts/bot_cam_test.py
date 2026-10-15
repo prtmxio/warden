@@ -22,8 +22,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 ap = argparse.ArgumentParser()
-ap.add_argument("--ip", default="10.200.124.103",
-                help="S3 IP address, e.g. 192.168.43.55")
+ap.add_argument("--ip", default="esp-cam.local",
+                help="S3 IP or hostname (default: esp-cam.local)")
 args = ap.parse_args()
 
 STREAM_URL = f"http://{args.ip}:81/stream"

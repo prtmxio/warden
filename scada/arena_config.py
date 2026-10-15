@@ -36,8 +36,8 @@ BOX_HSV_HI   = (179, 255, 255)
 BOX_MIN_AREA = 5000
 
 # IPs — update before first run
-PHONE_STREAM_URL  = "http://192.168.43.1:8080/video"
-S3_STREAM_URL     = "http://192.168.43.__:81/stream"
+PHONE_STREAM_URL  = "http://10.32.193.219:8080/video"
+S3_STREAM_URL     = "http://esp-cam.local:81/stream"
 BOT_IP            = "127.0.0.1"   # localhost for mock_bot; set real C6 IP before hardware run
 BOT_PORT          = 4210
 SCADA_LISTEN_PORT = 4211
