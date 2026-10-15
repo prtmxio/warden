@@ -23,6 +23,7 @@
 
 #include "camera_core.h"
 #include "img_converters.h"
+#include "mdns.h"
 
 /* ── Network constants ──────────────────────────────────────────────────── */
 
@@ -232,6 +233,11 @@ void app_main(void)
     ESP_LOGI(TAG, "=== ESP32-S3 booting ===");
 
     wifi_init_sta();
+
+    mdns_init();
+    mdns_hostname_set("esp-cam");
+    mdns_instance_name_set("Warden Cam");
+    ESP_LOGI(TAG, "mDNS started — hostname: esp-cam.local");
 
     if (camera_core_init() != ESP_OK) {
         ESP_LOGE(TAG, "Camera init failed — stream will not start");
