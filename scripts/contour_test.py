@@ -130,9 +130,11 @@ def main():
             boxes = detect_boxes(warped, s)
 
             for cnt, cx, cy, area in boxes:
-                cv2.drawContours(warped, [cnt], -1, (0, 255, 0), 2)
+                # bounding rect — easier to read than raw contour outline
+                rx, ry, rw, rh = cv2.boundingRect(cnt)
+                cv2.rectangle(warped, (rx, ry), (rx + rw, ry + rh), (0, 255, 0), 2)
                 cv2.circle(warped, (int(cx), int(cy)), 5, (0, 0, 255), -1)
-                cv2.putText(warped, f"{int(area)}px²", (int(cx) + 8, int(cy) - 8),
+                cv2.putText(warped, f"{int(area)}px²", (rx, ry - 6),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 0), 1)
 
             count_color = (0, 255, 0) if len(boxes) == 4 else (0, 0, 255)
