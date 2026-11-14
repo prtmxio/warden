@@ -17,7 +17,7 @@ import urllib.request
 import cv2
 import numpy as np
 import rclpy
-from geometry_msgs.msg import PoseWithCovarianceStamped
+from geometry_msgs.msg import Pose, PoseArray, PoseWithCovarianceStamped
 from nav_msgs.msg import OccupancyGrid
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile
@@ -25,7 +25,13 @@ from rclpy.qos import DurabilityPolicy, QoSProfile
 sys.path.insert(0, "/home/xio/Desktop/warden/scada")
 from arena_config import (
     ARENA_SIZE_CM, BOT_ARUCO_ID, CORNER_ARUCO_IDS, PHONE_STREAM_URL, WARP_SIZE,
+    BOX_HSV_LO, BOX_HSV_HI, BOX_MIN_AREA,
+    ARENA_FREE, TOP_ARUCO_IDS, BOT_MARKER_YAW_OFF,
 )
+
+# Box centroids closer than this to the bot marker are discarded — the bot (with its
+# ArUco standoff) can otherwise show up as a contour blob.
+_BOT_EXCLUDE_M = 0.20
 
 PX_PER_CM = WARP_SIZE / ARENA_SIZE_CM   # px per cm in the warped 800×800 image
 ARENA_M   = ARENA_SIZE_CM / 100.0       # arena side in metres
@@ -106,6 +112,17 @@ class VisionNode(Node):
             PoseWithCovarianceStamped, "/robot_pose", 10
         )
 
+        # /box_positions is latched (transient_local) so control_node always gets the
+        # most recent set of detected box centroids even if it snapshots them late.
+        box_qos = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        self._box_pub = self.create_publisher(PoseArray, "/box_positions", box_qos)
+
+        # Arena-free (pixel-space) topics: raw-image bot pose + box-top marker pixels.
+        #   /bot_px : position=(u,v) px, orientation=heading in the image (math-convention)
+        #   /box_px : one Pose per visible box-top marker; position=(u,v) px, z=float(ArUco id)
+        self._bot_px_pub = self.create_publisher(PoseWithCovarianceStamped, "/bot_px", 10)
+        self._box_px_pub = self.create_publisher(PoseArray, "/box_px", 10)
+
         # /map uses transient_local so Nav2 receives the static map even if it
         # subscribes after the message is first published.
         map_qos = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
@@ -117,11 +134,13 @@ class VisionNode(Node):
         self._detector = cv2.aruco.ArucoDetector(aruco_dict, aruco_params)
 
         self._H           = None   # homography; updated whenever all 4 corners visible
+        self._diag_t      = 0.0    # last time a diagnostic heartbeat was logged
         self._frame_lock  = threading.Lock()
         self._latest_frame = None
         self._stop_event  = threading.Event()
 
-        self._publish_map()
+        if not ARENA_FREE:
+            self._publish_map()
 
         self._capture_thread = threading.Thread(
             target=self._run_capture, daemon=True
@@ -130,9 +149,9 @@ class VisionNode(Node):
 
         self.create_timer(1.0 / 15.0, self._process_frame)
 
+        mode = "ARENA-FREE (pixel servo)" if ARENA_FREE else f"warped {ARENA_SIZE_CM}cm arena"
         self.get_logger().info(
-            f"vision_node started — stream: {PHONE_STREAM_URL} | "
-            f"arena: {ARENA_SIZE_CM}cm × {ARENA_SIZE_CM}cm ({ARENA_M:.1f}m)"
+            f"vision_node started — stream: {PHONE_STREAM_URL} | mode: {mode}"
         )
 
     def _publish_map(self):
@@ -167,28 +186,47 @@ class VisionNode(Node):
                     self.get_logger().warn(f"Stream error — reconnecting: {e}")
                     time.sleep(0.5)
 
+    def _diag(self, msg: str):
+        """Throttled (~1 Hz) status line so you can see what the camera is doing."""
+        now = time.time()
+        if now - self._diag_t >= 1.0:
+            self._diag_t = now
+            self.get_logger().info(f"[vision] {msg}")
+
     def _process_frame(self):
         with self._frame_lock:
             frame = self._latest_frame
         if frame is None:
+            self._diag("no frames from phone stream yet — check PHONE_STREAM_URL / hotspot")
             return
 
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         corners, ids, _ = self._detector.detectMarkers(gray)
 
-        if ids is None:
+        id_list   = [] if ids is None else [int(m) for m in ids.flatten()]
+
+        if ARENA_FREE:
+            self._process_frame_px(corners, id_list)
             return
 
+        n_corners = sum(1 for m in id_list if m in CORNER_ARUCO_IDS)
+
         # Update homography whenever all 4 corners are visible
-        new_H, _ = _compute_homography(corners, ids)
+        new_H, _ = _compute_homography(corners, ids) if ids is not None else (None, None)
         if new_H is not None:
             self._H = new_H
 
         if self._H is None:
+            missing = [c for c in CORNER_ARUCO_IDS if c not in id_list]
+            self._diag(
+                f"corners {n_corners}/4 — NO WARP yet. Missing corner IDs {missing}. "
+                f"All IDs seen now: {sorted(id_list)}"
+            )
             return
 
         # Find bot marker (ID 5) and publish pose
-        for i, mid in enumerate(ids.flatten()):
+        bot_world = None
+        for i, mid in enumerate(id_list):
             if mid != BOT_ARUCO_ID:
                 continue
             raw_cx, raw_cy = _marker_center(corners[i])
@@ -200,8 +238,120 @@ class VisionNode(Node):
             y_world = float((WARP_SIZE - wy) / PX_PER_CM / 100.0)
             yaw     = float(math.radians(_marker_heading(corners[i])))
 
+            bot_world = (x_world, y_world)
             self._publish_pose(x_world, y_world, yaw)
             break
+
+        # Detect box blobs in the warped arena and publish their world positions.
+        warped  = cv2.warpPerspective(frame, self._H, (WARP_SIZE, WARP_SIZE))
+        n_boxes = self._publish_boxes(warped, bot_world)
+
+        bot_str = (f"bot@({bot_world[0]:.2f},{bot_world[1]:.2f})"
+                   if bot_world is not None else "bot NOT seen (ID 5)")
+        self._diag(f"WARP-LOCKED (corners 4/4) | {bot_str} | boxes detected: {n_boxes}")
+
+    def _process_frame_px(self, corners, id_list):
+        """Arena-free path: publish the bot marker and box-top markers in raw image pixels.
+        No homography, no warp — control_node servos one marker toward the other directly.
+
+        Box top ArUco convention: its 'top edge' (forward direction) points TOWARD the
+        inspection face of the box. The control node will position the bot on that side,
+        approaching with its nose pointing 180° opposite — face-to-face docking."""
+        bot_px = None
+        for i, mid in enumerate(id_list):
+            if mid == BOT_ARUCO_ID:
+                u, v = _marker_center(corners[i])
+                hdg  = _marker_heading(corners[i]) + BOT_MARKER_YAW_OFF
+                bot_px = (u, v, math.radians(hdg))
+                self._publish_bot_px(u, v, math.radians(hdg))
+                break
+
+        boxes = []
+        for i, mid in enumerate(id_list):
+            if mid in TOP_ARUCO_IDS:
+                u, v   = _marker_center(corners[i])
+                hdg    = _marker_heading(corners[i])   # top edge → inspection face direction
+                boxes.append((mid, u, v, hdg))
+        self._publish_box_px(boxes)
+
+        if bot_px is None:
+            self._diag(f"bot NOT seen (ID {BOT_ARUCO_ID}) | box markers: "
+                       f"{[b[0] for b in boxes]} | all IDs: {sorted(id_list)}")
+        else:
+            self._diag(f"bot@px({bot_px[0]:.0f},{bot_px[1]:.0f}) "
+                       f"hdg={math.degrees(bot_px[2]):.0f}° | box markers: "
+                       f"{[(b[0], int(b[1]), int(b[2]), int(b[3])) for b in boxes]}")
+
+    def _publish_bot_px(self, u: float, v: float, heading: float):
+        msg = PoseWithCovarianceStamped()
+        msg.header.frame_id = "image"
+        msg.header.stamp    = self.get_clock().now().to_msg()
+        msg.pose.pose.position.x = float(u)
+        msg.pose.pose.position.y = float(v)
+        msg.pose.pose.orientation.z = math.sin(heading / 2.0)
+        msg.pose.pose.orientation.w = math.cos(heading / 2.0)
+        self._bot_px_pub.publish(msg)
+
+    def _publish_box_px(self, boxes):
+        """Publish box-top markers.  Each Pose encodes:
+          position.x/y = pixel centre (u, v)
+          position.z   = float(ArUco id)
+          orientation  = box top heading as a planar quaternion
+                         (top edge of the printed marker → inspection face direction)
+        The control_node uses this heading to compute the face-on approach point so the
+        bot arrives with its nose 180° opposite to the box's forward direction."""
+        msg = PoseArray()
+        msg.header.frame_id = "image"
+        msg.header.stamp    = self.get_clock().now().to_msg()
+        for bid, u, v, hdg_deg in boxes:
+            p = Pose()
+            p.position.x = float(u)
+            p.position.y = float(v)
+            p.position.z = float(bid)        # ArUco id carried in z
+            hdg_rad = math.radians(hdg_deg)
+            p.orientation.z = math.sin(hdg_rad / 2.0)
+            p.orientation.w = math.cos(hdg_rad / 2.0)
+            msg.poses.append(p)
+        self._box_px_pub.publish(msg)
+
+    def _detect_box_centroids(self, warped_bgr):
+        """Return [(x_m, y_m), …] world-metre centroids of box-coloured blobs.
+        HSV thresholds + min-area come from arena_config (tuned via contour_test.py)."""
+        hsv  = cv2.cvtColor(warped_bgr, cv2.COLOR_BGR2HSV)
+        mask = cv2.inRange(hsv, np.array(BOX_HSV_LO), np.array(BOX_HSV_HI))
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  kernel, iterations=1)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        out = []
+        for cnt in contours:
+            if cv2.contourArea(cnt) < BOX_MIN_AREA:
+                continue
+            M = cv2.moments(cnt)
+            if M["m00"] <= 0:
+                continue
+            cx = M["m10"] / M["m00"]
+            cy = M["m01"] / M["m00"]
+            out.append((float(cx / PX_PER_CM / 100.0),
+                        float((WARP_SIZE - cy) / PX_PER_CM / 100.0)))
+        return out
+
+    def _publish_boxes(self, warped_bgr, bot_world):
+        centroids = self._detect_box_centroids(warped_bgr)
+        msg = PoseArray()
+        msg.header.frame_id = "map"
+        msg.header.stamp    = self.get_clock().now().to_msg()
+        for x, y in centroids:
+            if bot_world is not None and math.hypot(x - bot_world[0], y - bot_world[1]) < _BOT_EXCLUDE_M:
+                continue   # this blob is the bot itself, not a box
+            p = Pose()
+            p.position.x = x
+            p.position.y = y
+            p.orientation.w = 1.0
+            msg.poses.append(p)
+        self._box_pub.publish(msg)
+        return len(msg.poses)
 
     def _publish_pose(self, x: float, y: float, yaw: float):
         msg = PoseWithCovarianceStamped()
