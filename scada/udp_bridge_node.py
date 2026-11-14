@@ -30,17 +30,38 @@ from std_msgs.msg import String
 sys.path.insert(0, "/home/xio/Desktop/warden/scada")
 from arena_config import (
     BOT_IP, BOT_PORT, SCADA_LISTEN_PORT,
-    WHEEL_SEPARATION, MAX_LINEAR_VEL, MAX_PWM,
+    WHEEL_SEPARATION, MAX_LINEAR_VEL, MAX_PWM, MIN_MOVE_PWM,
 )
 
 
+def _floor_pwm(p: int) -> int:
+    """Bump any nonzero command up to MIN_MOVE_PWM (keeping sign); leave 0 as 0."""
+    if p == 0:
+        return 0
+    return int(math.copysign(max(abs(p), MIN_MOVE_PWM), p))
+
+
 def vel_to_pwm(linear_x: float, angular_z: float) -> tuple[int, int]:
-    """Convert Twist to left/right PWM values in [-MAX_PWM, MAX_PWM]."""
+    """Convert Twist to left/right PWM values in [-MAX_PWM, MAX_PWM],
+    scaling proportionally so motors overcome static friction without
+    destroying the differential steering ratio."""
+    if linear_x == 0.0 and angular_z == 0.0:
+        return 0, 0
+
     v_left  = linear_x - angular_z * WHEEL_SEPARATION / 2.0
     v_right = linear_x + angular_z * WHEEL_SEPARATION / 2.0
     scale   = MAX_PWM / MAX_LINEAR_VEL
     left    = int(max(-MAX_PWM, min(MAX_PWM, v_left  * scale)))
     right   = int(max(-MAX_PWM, min(MAX_PWM, v_right * scale)))
+
+    # If the dominant motor is below MIN_MOVE_PWM, boost both proportionally
+    # so static friction is overcome while preserving smooth differential steering.
+    max_val = max(abs(left), abs(right))
+    if 0 < max_val < MIN_MOVE_PWM:
+        boost = float(MIN_MOVE_PWM) / max_val
+        left  = int(math.copysign(min(MAX_PWM, abs(left) * boost), left))
+        right = int(math.copysign(min(MAX_PWM, abs(right) * boost), right))
+
     return left, right
 
 
@@ -69,9 +90,42 @@ class UdpBridgeNode(Node):
         self._rx_thread = threading.Thread(target=self._rx_loop, daemon=True)
         self._rx_thread.start()
 
+        # Heartbeat: publish current odom at 10 Hz so the EKF always has input
+        # and publishes TF even before the first real ODOM packet arrives.
+        # After the bot connects, _publish_odom() updates _x/_y/_yaw and this
+        # timer just re-publishes the same accumulated pose — no double-counting.
+        self._odom_timer = self.create_timer(0.1, self._publish_heartbeat_odom)
+
         self.get_logger().info(
             f"udp_bridge: listening :{SCADA_LISTEN_PORT}, bot={self._bot_addr}"
         )
+
+    # ------------------------------------------------------------------ helpers
+    def _make_odom_msg(self) -> Odometry:
+        """Build an Odometry message from the current accumulated pose with covariance."""
+        msg = Odometry()
+        msg.header.stamp    = self.get_clock().now().to_msg()
+        msg.header.frame_id = "odom"
+        msg.child_frame_id  = "base_footprint"
+        msg.pose.pose.position.x = self._x
+        msg.pose.pose.position.y = self._y
+        cy = math.cos(self._yaw / 2.0)
+        sy = math.sin(self._yaw / 2.0)
+        msg.pose.pose.orientation.z = sy
+        msg.pose.pose.orientation.w = cy
+        # Pose covariance (6×6 row-major, diagonal only).
+        # Encoders drift — trust less than the camera /robot_pose source.
+        c = msg.pose.covariance
+        c[0]  = 0.01   # x  (~10 cm std)
+        c[7]  = 0.01   # y  (~10 cm std)
+        c[14] = 1e9    # z  — 2-D mode
+        c[21] = 1e9    # roll — 2-D mode
+        c[28] = 1e9    # pitch — 2-D mode
+        c[35] = 0.05   # yaw (~13° std)
+        return msg
+
+    def _publish_heartbeat_odom(self):
+        self._odom_pub.publish(self._make_odom_msg())
 
     # ------------------------------------------------------------------ send
     def _send(self, payload: str):
@@ -94,7 +148,10 @@ class UdpBridgeNode(Node):
     def _rx_loop(self):
         while rclpy.ok():
             try:
-                data, _ = self._sock.recvfrom(256)
+                data, addr = self._sock.recvfrom(256)
+                if addr and addr[0] != self._bot_addr[0]:
+                    self.get_logger().info(f"Learned bot IP from incoming packet: {addr[0]}:{BOT_PORT}")
+                    self._bot_addr = (addr[0], BOT_PORT)
             except socket.timeout:
                 continue
             except OSError:
@@ -142,17 +199,7 @@ class UdpBridgeNode(Node):
         self._y   += d * math.sin(self._yaw + dth / 2.0)
         self._yaw  = heading        # firmware sends absolute heading from encoder integration
 
-        msg = Odometry()
-        msg.header.stamp    = self.get_clock().now().to_msg()
-        msg.header.frame_id = "odom"
-        msg.child_frame_id  = "base_link"
-        msg.pose.pose.position.x = self._x
-        msg.pose.pose.position.y = self._y
-        cy = math.cos(self._yaw / 2.0)
-        sy = math.sin(self._yaw / 2.0)
-        msg.pose.pose.orientation.z = sy
-        msg.pose.pose.orientation.w = cy
-        self._odom_pub.publish(msg)
+        self._odom_pub.publish(self._make_odom_msg())
 
 
 def main(args=None):
@@ -163,7 +210,8 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     node.destroy_node()
-    rclpy.shutdown()
+    if rclpy.ok():
+        rclpy.shutdown()
 
 
 if __name__ == "__main__":
