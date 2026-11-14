@@ -21,6 +21,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <errno.h>
+#include <math.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -80,11 +81,30 @@ static QueueHandle_t s_motor_q;
 #define PIN_ENC_R_C1  GPIO_NUM_18
 #define PIN_ENC_R_C2  GPIO_NUM_15
 
+/* Odometry calibration. TICKS_PER_M is encoder counts per metre of wheel travel — CALIBRATE by
+ * driving a measured 1.0 m straight and reading the summed ODOM deltas (scripts/udp_echo.py), then
+ * set this so the sum ≈ 1.0. WHEEL_SEP_M must match arena_config.WHEEL_SEPARATION. The ENC_*_SIGN
+ * flip a side to +1 if a FORWARD command yields positive ticks, -1 otherwise (depends on how the
+ * C1/C2 phases and motor wiring line up — fix empirically so forward = positive on both sides). */
+#define TICKS_PER_M   2465.0f
+#define WHEEL_SEP_M   0.12f
+#define ENC_L_SIGN    (-1)
+#define ENC_R_SIGN    (+1)
+
 static volatile int32_t s_left_ticks  = 0;
 static volatile int32_t s_right_ticks = 0;
 
-static void IRAM_ATTR enc_left_isr(void *arg)  { s_left_ticks++;  }
-static void IRAM_ATTR enc_right_isr(void *arg) { s_right_ticks++; }
+/* Quadrature decode: C1 fires the interrupt on its rising edge; the C2 phase level at that instant
+ * gives the rotation direction, so the counts are signed (reverse decrements) — single-channel
+ * counting could only ever go up. gpio_get_level is a plain register read, safe from an IRAM ISR. */
+static void IRAM_ATTR enc_left_isr(void *arg)
+{
+    s_left_ticks  += gpio_get_level(PIN_ENC_L_C2) ? ENC_L_SIGN : -ENC_L_SIGN;
+}
+static void IRAM_ATTR enc_right_isr(void *arg)
+{
+    s_right_ticks += gpio_get_level(PIN_ENC_R_C2) ? ENC_R_SIGN : -ENC_R_SIGN;
+}
 
 /* ── VL53L0X I2C config ─────────────────────────────────────────────────── */
 
@@ -93,12 +113,15 @@ static void IRAM_ATTR enc_right_isr(void *arg) { s_right_ticks++; }
 #define PIN_SCL         GPIO_NUM_7
 #define I2C_SPEED_HZ    10000    /* 10 kHz — safe with 45 kΩ internal pull-ups + any wire capacitance */
 
-/* Two-point linear offset correction based on physical measurements.
- * Recalibrate if the VL53L0X module is swapped. */
-#define TOF_CAL_RAW1  137   /* raw reading at close cal point (mm) */
-#define TOF_CAL_ACT1   36   /* actual distance at close cal point (mm) */
-#define TOF_CAL_RAW2  250   /* raw reading at far cal point (mm) */
-#define TOF_CAL_ACT2  115   /* actual distance at far cal point (mm) */
+/* The ST-API init sequence below leaves the sensor reporting TRUE millimetres
+ * natively — do NOT rescale it. If, after validating against a ruler at a sane
+ * distance (100-500 mm, flat target), a consistent bias remains, measure the true
+ * distance at ONE point and set TOF_OFFSET_MM = (true_mm − reported_mm). Leave it 0
+ * for the native reading. (Readings below ~50 mm are inherently unreliable — the
+ * sensor saturates and over-reads in the near field; don't calibrate there.) */
+#define TOF_OFFSET_MM   -97
+#define TOF_NO_TARGET   8190   /* sentinel the sensor returns when nothing is in range */
+#define TOF_FILTER_N    5      /* median window — smooths per-sample jitter without lag */
 
 /* ── Watchdog + repair constants ────────────────────────────────────────── */
 
@@ -218,14 +241,42 @@ static void set_motor_side(gpio_num_t in1, gpio_num_t in2,
 
 /* ── Motor task ─────────────────────────────────────────────────────────── */
 
+/* Slew-rate ramp. The SCADA side floors any nonzero wheel command up to MIN_MOVE_PWM (~100) to
+ * beat static friction, so even a "gentle" pan or dock-creep arrives as a full ±100 step. Applied
+ * instantly that snaps the wheels — blurring the S3's view during the inspection sweep and jerking
+ * every traversal. Ramp the applied duty toward the commanded target a few counts per 10 ms tick
+ * instead. ASYMMETRIC on purpose: accelerate slowly (small, blur-free, fine-grained pulses) but
+ * decelerate fast, so STOP / dock-stop still bite within ~25 ms and docking gains no extra coast. */
+#define RAMP_TICK_MS   10
+#define RAMP_ACCEL     8    /* duty counts per tick while speeding up (0→100 in ~125 ms) */
+#define RAMP_DECEL     40   /* duty counts per tick while slowing/reversing (100→0 in ~25 ms) */
+
+static int ramp_toward(int cur, int tgt)
+{
+    /* accelerating = same sign (or from rest) AND growing in magnitude; else decelerating */
+    bool accel = (cur == 0 || (tgt >= 0) == (cur >= 0)) && abs(tgt) >= abs(cur);
+    int step = accel ? RAMP_ACCEL : RAMP_DECEL;
+    if (cur < tgt) { cur += step; if (cur > tgt) cur = tgt; }
+    else if (cur > tgt) { cur -= step; if (cur < tgt) cur = tgt; }
+    return cur;
+}
+
 static void motor_task(void *arg)
 {
     motor_cmd_t cmd;
+    int tgt_l = 0, tgt_r = 0;   /* latest commanded target */
+    int cur_l = 0, cur_r = 0;   /* duty actually applied, ramped toward target */
     while (1) {
-        if (xQueueReceive(s_motor_q, &cmd, portMAX_DELAY) == pdTRUE) {
-            set_motor_side(PIN_AIN1, PIN_AIN2, LEDC_CH_LEFT,  cmd.left);
-            set_motor_side(PIN_BIN1, PIN_BIN2, LEDC_CH_RIGHT, cmd.right);
+        /* Non-blocking: grab the latest target if one was posted, else hold the last one. */
+        if (xQueueReceive(s_motor_q, &cmd, 0) == pdTRUE) {
+            tgt_l = cmd.left;
+            tgt_r = cmd.right;
         }
+        cur_l = ramp_toward(cur_l, tgt_l);
+        cur_r = ramp_toward(cur_r, tgt_r);
+        set_motor_side(PIN_AIN1, PIN_AIN2, LEDC_CH_LEFT,  cur_l);
+        set_motor_side(PIN_BIN1, PIN_BIN2, LEDC_CH_RIGHT, cur_r);
+        vTaskDelay(pdMS_TO_TICKS(RAMP_TICK_MS));
     }
 }
 
@@ -233,6 +284,7 @@ static void motor_task(void *arg)
 
 static void encoders_init(void)
 {
+    /* C1 channels: interrupt on the rising edge — these are the tick source. */
     gpio_config_t gc = {
         .pin_bit_mask = (1ULL << PIN_ENC_L_C1) | (1ULL << PIN_ENC_R_C1),
         .mode         = GPIO_MODE_INPUT,
@@ -242,18 +294,30 @@ static void encoders_init(void)
     };
     gpio_config(&gc);
 
+    /* C2 channels: plain inputs, sampled inside the C1 ISR for the quadrature direction bit. */
+    gpio_config_t gc2 = {
+        .pin_bit_mask = (1ULL << PIN_ENC_L_C2) | (1ULL << PIN_ENC_R_C2),
+        .mode         = GPIO_MODE_INPUT,
+        .pull_up_en   = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&gc2);
+
     gpio_install_isr_service(0);
     gpio_isr_handler_add(PIN_ENC_L_C1, enc_left_isr, NULL);
     gpio_isr_handler_add(PIN_ENC_R_C1, enc_right_isr, NULL);
 
-    ESP_LOGI(TAG, "encoders init done");
+    ESP_LOGI(TAG, "encoders init done (quadrature)");
 }
 
 /* ── Encoder task ───────────────────────────────────────────────────────── */
 
 static void encoder_task(void *arg)
 {
-    char buf[48];
+    char buf[64];
+    int32_t prev_l = 0, prev_r = 0;
+    float heading = 0.0f;   /* integrated absolute heading (rad) in the odom frame */
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(50));
         if (s_sock < 0) continue;
@@ -264,9 +328,21 @@ static void encoder_task(void *arg)
         taskEXIT_CRITICAL(&s_scada_mux);
         if (scada.sin_addr.s_addr == 0) continue;   /* no SCADA seen yet */
 
+        /* Per-interval SIGNED wheel travel in metres. The SCADA udp_bridge expects exactly
+         * ODOM:dl_m:dr_m:heading_rad — dl/dr integrated into x/y, heading taken as ABSOLUTE —
+         * so we integrate heading here on-device from the differential-drive kinematics. */
         int32_t l = s_left_ticks;
         int32_t r = s_right_ticks;
-        int n = snprintf(buf, sizeof(buf), "ODOM:%d:%d:0\n", (int)l, (int)r);
+        float dl = (l - prev_l) / TICKS_PER_M;
+        float dr = (r - prev_r) / TICKS_PER_M;
+        prev_l = l;
+        prev_r = r;
+
+        heading += (dr - dl) / WHEEL_SEP_M;
+        if (heading >  (float)M_PI) heading -= 2.0f * (float)M_PI;
+        if (heading < -(float)M_PI) heading += 2.0f * (float)M_PI;
+
+        int n = snprintf(buf, sizeof(buf), "ODOM:%.5f:%.5f:%.5f\n", dl, dr, heading);
         sendto(s_sock, buf, n, 0, (struct sockaddr *)&scada, sizeof(scada));
     }
 }
@@ -510,22 +586,22 @@ static esp_err_t vl53l0x_init(void)
     return ESP_OK;
 }
 
-/* ── TOF calibration correction ─────────────────────────────────────────── */
-
-static uint16_t tof_correct(uint16_t raw)
+/* ── TOF reading finalize ───────────────────────────────────────────────── */
+/* The value read from register 0x1E is already true millimetres. Pass it through,
+ * applying only the honest single-point offset and the no-target sentinel. */
+static uint16_t tof_finalize(uint16_t raw)
 {
-    if (raw >= 8000) return 2000;  /* cap no-target at 2000 mm */
-    float slope = (float)(TOF_CAL_ACT2 - TOF_CAL_ACT1)
-                / (float)(TOF_CAL_RAW2 - TOF_CAL_RAW1);
-    float c = slope * ((float)raw - TOF_CAL_RAW1) + TOF_CAL_ACT1;
-    return (c > 0.0f) ? (uint16_t)(c + 0.5f) : 0;
+    if (raw >= 8000) return TOF_NO_TARGET;   /* no target in range */
+    int v = (int)raw + TOF_OFFSET_MM;
+    if (v < 0) v = 0;
+    return (uint16_t)v;
 }
 
 /* ── TOF task ───────────────────────────────────────────────────────────── */
 /*
  * Polls the sensor interrupt status (~33 ms measurement period), reads the
- * 16-bit range result at register 0x1E, then sends TOF:<mm>\n to SCADA.
- * 2000 mm is emitted when the sensor reports no target (raw >= 8000).
+ * 16-bit range result at register 0x1E (already true mm), then sends TOF:<mm>\n
+ * to SCADA. TOF_NO_TARGET (8190) is emitted when the sensor reports no target.
  */
 static void tof_task(void *arg)
 {
@@ -541,11 +617,11 @@ static void tof_task(void *arg)
             vTaskDelay(pdMS_TO_TICKS(2));
         } while (++retries < 50);   /* max ~100 ms wait */
 
-        uint16_t range_mm = 8190;
+        uint16_t range_mm = TOF_NO_TARGET;
         if (status & 0x07) {
             vl53_read16(0x1E, &range_mm);
             vl53_write(0x0B, 0x01);   /* clear interrupt so next reading is fresh */
-            range_mm = tof_correct(range_mm);
+            range_mm = tof_finalize(range_mm);
         }
 
         if (s_sock < 0) continue;
@@ -839,7 +915,7 @@ void app_main(void)
 
     xTaskCreate(motor_task,   "motor",   2048, NULL, 6, NULL);
     xTaskCreate(udp_rx_task,  "udp_rx",  4096, NULL, 5, NULL);
-    xTaskCreate(encoder_task, "encoder", 2048, NULL, 4, NULL);
+    xTaskCreate(encoder_task, "encoder", 4096, NULL, 4, NULL);
 
     if (s_vl53_dev != NULL) {
         xTaskCreate(tof_task, "tof", 2048, NULL, 3, NULL);
