@@ -177,11 +177,13 @@ class GuiNode(Node):
         self.create_subscription(Range, "/tof_range",
                                  self._on_tof, 10)
 
+        # Always subscribe to bot camera frames (published by bot_cam_node or simulation)
+        self.create_subscription(RosImage, "/camera/camera_sensor/image_raw",
+                                 self._on_bot_cam_img, 5)
+
         if "--sim" in sys.argv:
             self.create_subscription(RosImage, "/overhead_camera/image_raw",
                                      self._on_overhead_img, 5)
-            self.create_subscription(RosImage, "/camera/camera_sensor/image_raw",
-                                     self._on_bot_cam_img, 5)
             self.create_subscription(RosImage, "/tof_sensor/depth_sensor/depth/image_raw",
                                      self._on_tof_depth_img, 5)
 
@@ -730,14 +732,11 @@ class MainWindow(QMainWindow):
             self._phone_cam.frame_ready.connect(self._on_phone_frame)
             self._phone_cam.start()
 
-        self._bot_cam_started = "--sim" in sys.argv
-        self._bot_cam = None
+        # Bot cam feed is streamed directly via ROS /camera/camera_sensor/image_raw
+        # published by bot_cam_node (hardware) or gazebo (sim), avoiding dual-stream collisions.
+        bridge.sig_bot_frame.connect(self._on_bot_frame)
         if "--sim" in sys.argv:
-            bridge.sig_bot_frame.connect(self._on_bot_frame)
             bridge.sig_tof_frame.connect(self._on_tof_frame)
-        else:
-            self._bot_cam = CameraThread(S3_STREAM_URL, fps=15)
-            self._bot_cam.frame_ready.connect(self._on_bot_frame)
 
         self._blink_timer = QTimer()
         self._blink_timer.setInterval(500)
@@ -781,7 +780,7 @@ class MainWindow(QMainWindow):
 
         cams = QHBoxLayout()
         self._phone_lbl = self._cam_label("Phone Cam — overhead MJPEG\n(no feed without hardware)")
-        self._bot_lbl   = self._cam_label("Bot Cam (S3)\n(activates during INSPECTING)")
+        self._bot_lbl   = self._cam_label("Bot Cam (S3)\nWaiting for stream...")
         cams.addWidget(self._phone_lbl)
         cams.addWidget(self._bot_lbl)
         left.addLayout(cams)
@@ -934,11 +933,10 @@ class MainWindow(QMainWindow):
         self._arena.set_background_image(img)
 
     def _on_bot_frame(self, img: QImage):
-        if "--sim" in sys.argv or self._fsm_state == "INSPECTING":
-            pix = QPixmap.fromImage(img).scaled(
-                480, 270, Qt.KeepAspectRatio, Qt.SmoothTransformation
-            )
-            self._bot_lbl.setPixmap(pix)
+        pix = QPixmap.fromImage(img).scaled(
+            480, 270, Qt.KeepAspectRatio, Qt.SmoothTransformation
+        )
+        self._bot_lbl.setPixmap(pix)
 
     def _on_tof_frame(self, img: QImage):
         pix = QPixmap.fromImage(img).scaled(
@@ -969,10 +967,6 @@ class MainWindow(QMainWindow):
             self._queue_btn.setEnabled(True)
         else:
             self._queue_btn.setEnabled(False)
-
-        if state == "INSPECTING" and not self._bot_cam_started and self._bot_cam is not None:
-            self._bot_cam.start()
-            self._bot_cam_started = True
 
         if state not in ("SETUP", "MISSION_COMPLETE"):
             self._start_btn.setVisible(False)
@@ -1053,7 +1047,7 @@ class MainWindow(QMainWindow):
         self._blink_timer.stop()
         if self._phone_cam is not None:
             self._phone_cam.stop()
-        if self._bot_cam is not None:
+        if hasattr(self, "_bot_cam") and self._bot_cam is not None:
             self._bot_cam.stop()
         event.accept()
 
