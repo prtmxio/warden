@@ -128,9 +128,16 @@ class VisionNode(Node):
         map_qos = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
         self._map_pub = self.create_publisher(OccupancyGrid, "/map", map_qos)
 
-        # ArUco detector — same settings as warp_live_test.py
+        # ArUco detector. Sub-pixel corner refinement is essential here: the bot heading is
+        # derived from the marker's corner geometry, and raw (integer-pixel) corners jitter by
+        # several degrees frame-to-frame — enough that the control node could never settle an
+        # alignment. SUBPIX localises each corner to a fraction of a pixel, cutting that noise.
         aruco_dict   = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
         aruco_params = cv2.aruco.DetectorParameters()
+        aruco_params.cornerRefinementMethod     = cv2.aruco.CORNER_REFINE_SUBPIX
+        aruco_params.cornerRefinementWinSize     = 5
+        aruco_params.cornerRefinementMaxIterations = 30
+        aruco_params.cornerRefinementMinAccuracy = 0.01
         self._detector = cv2.aruco.ArucoDetector(aruco_dict, aruco_params)
 
         self._H           = None   # homography; updated whenever all 4 corners visible
