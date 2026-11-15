@@ -130,6 +130,29 @@ static void IRAM_ATTR enc_right_isr(void *arg)
 #define REPAIR_FWD_SAFETY_MS   5000   /* hard timeout if SCADA never sends REPAIR_STOP */
 #define REPAIR_INDICATOR_CYCLES   6   /* LED blink count after contact */
 
+/* ── Closed-loop motion primitives ──────────────────────────────────────── */
+/* TURN:<deg> and FWD:<mm> run an on-device encoder loop to completion, then report
+ * STATUS:TURN_DONE / STATUS:FWD_DONE. The camera heading from the overhead ArUco is far
+ * too noisy to servo on directly; SCADA uses it only to compute a GOAL, then fires one of
+ * these — the ticks give repeatable rotation and, crucially, FWD equalises the two wheels'
+ * travel so the bot drives (and reverses) dead straight instead of skidding. The outer loop
+ * here just re-targets the motor queue every PRIM_TICK_MS; motor_task's ramp smooths it. */
+#define PRIM_TICK_MS        10
+#define PRIM_TURN_KP        0.6f   /* PWM per tick of remaining rotation error — lower = eases into
+                                      target instead of driving near-full-speed then slamming to 0 */
+#define PRIM_FWD_KP         0.6f   /* PWM per tick of remaining distance error */
+#define PRIM_STRAIGHT_KP    2.0f   /* PWM per tick of left/right travel mismatch (anti-skid) */
+#define PRIM_TOL_TICKS      2      /* done band per wheel (~0.8 mm / ~0.76°) */
+#define PRIM_MIN_PWM        60     /* floor applied only while still out of band — the closed loop
+                                      still reaches target at this duty; lower = gentle small nudges
+                                      instead of an 80-PWM snap on every 1° correction */
+#define PRIM_MAX_PWM        110    /* gentler top speed on turns/creeps (was 160 = lurchy) */
+#define PRIM_SAFETY_MS      4000   /* hard per-primitive timeout — report DONE regardless */
+#define PRIM_DONE_CYCLES    3      /* consecutive in-band cycles before declaring done */
+
+typedef struct { int kind; float value; } prim_cmd_t;   /* kind: 0 = TURN (deg), 1 = FWD (mm) */
+static QueueHandle_t s_prim_q;
+
 /* ── Indicator LED ──────────────────────────────────────────────────────── */
 
 #define PIN_LED  GPIO_NUM_47
@@ -169,6 +192,9 @@ static TaskHandle_t s_repair_task_handle = NULL;
 
 /* Set true during repair cycle so the watchdog doesn't override motor commands */
 static volatile bool s_repair_active = false;
+
+/* Set true while a TURN/FWD primitive runs so the watchdog doesn't zero the motors mid-move */
+static volatile bool s_primitive_active = false;
 
 /* Set true by udp_rx_task on "REPAIR_STOP"; ends the forward drive in repair_task */
 static volatile bool s_repair_stop = false;
@@ -248,8 +274,10 @@ static void set_motor_side(gpio_num_t in1, gpio_num_t in2,
  * instead. ASYMMETRIC on purpose: accelerate slowly (small, blur-free, fine-grained pulses) but
  * decelerate fast, so STOP / dock-stop still bite within ~25 ms and docking gains no extra coast. */
 #define RAMP_TICK_MS   10
-#define RAMP_ACCEL     8    /* duty counts per tick while speeding up (0→100 in ~125 ms) */
-#define RAMP_DECEL     40   /* duty counts per tick while slowing/reversing (100→0 in ~25 ms) */
+#define RAMP_ACCEL     6    /* duty counts per tick while speeding up (gentler launch) */
+#define RAMP_DECEL     14   /* duty counts per tick while slowing/reversing — soft stop instead of a
+                               40/tick slam, which was the hard jerk at the end of every primitive.
+                               Still fast enough (100→0 in ~70 ms) for the watchdog-STOP to be safe. */
 
 static int ramp_toward(int cur, int tgt)
 {
@@ -761,6 +789,12 @@ static void udp_rx_task(void *arg)
             cmd.left  = l;
             cmd.right = r;
             xQueueOverwrite(s_motor_q, &cmd);
+        } else if (strncmp(rx_buf, "TURN:", 5) == 0) {
+            prim_cmd_t pc = {0, (float)atof(rx_buf + 5)};
+            xQueueOverwrite(s_prim_q, &pc);
+        } else if (strncmp(rx_buf, "FWD:", 4) == 0) {
+            prim_cmd_t pc = {1, (float)atof(rx_buf + 4)};
+            xQueueOverwrite(s_prim_q, &pc);
         } else if (strncmp(rx_buf, "STOP", 4) == 0) {
             cmd.left = 0;
             cmd.right = 0;
@@ -792,8 +826,128 @@ static void watchdog_task(void *arg)
         vTaskDelay(pdMS_TO_TICKS(100));
         if (s_last_rx_ms == 0) continue;   /* not yet connected */
         uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
-        if (!s_repair_active && (now - s_last_rx_ms) > WATCHDOG_TIMEOUT_MS) {
+        if (!s_repair_active && !s_primitive_active && (now - s_last_rx_ms) > WATCHDOG_TIMEOUT_MS) {
             xQueueOverwrite(s_motor_q, &stop);
+        }
+    }
+}
+
+/* ── Motion primitive task ──────────────────────────────────────────────── */
+
+static uint32_t now_ms(void)
+{
+    return (uint32_t)(esp_timer_get_time() / 1000);
+}
+
+/* Map a raw P-controller output to a motor duty: cap to ±PRIM_MAX_PWM, and while the wheel
+ * is still out of band floor the magnitude up to PRIM_MIN_PWM so static friction is beaten;
+ * once in band, command 0 so the wheel doesn't creep past the target. */
+static int prim_pwm(float raw, int32_t abserr)
+{
+    int p = (int)raw;
+    if (p >  PRIM_MAX_PWM) p =  PRIM_MAX_PWM;
+    if (p < -PRIM_MAX_PWM) p = -PRIM_MAX_PWM;
+    if (abserr > PRIM_TOL_TICKS) {
+        if (p > 0 && p <  PRIM_MIN_PWM) p =  PRIM_MIN_PWM;
+        if (p < 0 && p > -PRIM_MIN_PWM) p = -PRIM_MIN_PWM;
+    } else {
+        p = 0;
+    }
+    return p;
+}
+
+/* In-place rotation by `deg` (signed; CCW positive, matching the odom heading integration
+ * heading += (dr - dl)/WHEEL_SEP). CCW ⇒ left wheel back, right wheel forward. */
+static void run_turn(float deg)
+{
+    int32_t l0 = s_left_ticks, r0 = s_right_ticks;
+    float   rad  = deg * (float)M_PI / 180.0f;
+    float   sign = (rad >= 0.0f) ? 1.0f : -1.0f;
+    int32_t tgt  = (int32_t)(fabsf(rad) * (WHEEL_SEP_M / 2.0f) * TICKS_PER_M);
+    int32_t lt   = l0 - (int32_t)(sign * tgt);
+    int32_t rt   = r0 + (int32_t)(sign * tgt);
+
+    int done = 0;
+    uint32_t t0 = now_ms();
+    while (1) {
+        int32_t el = lt - s_left_ticks;
+        int32_t er = rt - s_right_ticks;
+        if (abs(el) <= PRIM_TOL_TICKS && abs(er) <= PRIM_TOL_TICKS) {
+            if (++done >= PRIM_DONE_CYCLES) break;
+        } else {
+            done = 0;
+        }
+        motor_cmd_t c = {
+            prim_pwm(PRIM_TURN_KP * (float)el, abs(el)),
+            prim_pwm(PRIM_TURN_KP * (float)er, abs(er)),
+        };
+        xQueueOverwrite(s_motor_q, &c);
+        if (now_ms() - t0 > PRIM_SAFETY_MS) break;
+        vTaskDelay(pdMS_TO_TICKS(PRIM_TICK_MS));
+    }
+    motor_cmd_t stop = {0, 0};
+    xQueueOverwrite(s_motor_q, &stop);
+}
+
+/* Straight drive by `mm` (signed; negative = reverse). base PWM comes from the mean remaining
+ * distance; the steer term feeds back the mismatch between the two wheels' travel so they stay
+ * locked together — this is what keeps the line straight and kills the backtrack skid. */
+static void run_fwd(float mm)
+{
+    int32_t l0 = s_left_ticks, r0 = s_right_ticks;
+    int32_t tgt = (int32_t)((mm / 1000.0f) * TICKS_PER_M);   /* signed */
+    int32_t lt  = l0 + tgt;
+    int32_t rt  = r0 + tgt;
+
+    int done = 0;
+    uint32_t t0 = now_ms();
+    while (1) {
+        int32_t el = lt - s_left_ticks;
+        int32_t er = rt - s_right_ticks;
+        if (abs(el) <= PRIM_TOL_TICKS && abs(er) <= PRIM_TOL_TICKS) {
+            if (++done >= PRIM_DONE_CYCLES) break;
+        } else {
+            done = 0;
+        }
+        float meanerr = (float)(el + er) / 2.0f;
+        float steer   = PRIM_STRAIGHT_KP * (float)((s_right_ticks - r0) - (s_left_ticks - l0));
+        int   base    = (int)(PRIM_FWD_KP * meanerr);
+        if (meanerr >  PRIM_TOL_TICKS && base <  PRIM_MIN_PWM) base =  PRIM_MIN_PWM;
+        if (meanerr < -PRIM_TOL_TICKS && base > -PRIM_MIN_PWM) base = -PRIM_MIN_PWM;
+
+        int pl = base + (int)steer;
+        int pr = base - (int)steer;
+        if (pl >  PRIM_MAX_PWM) pl =  PRIM_MAX_PWM;
+        if (pl < -PRIM_MAX_PWM) pl = -PRIM_MAX_PWM;
+        if (pr >  PRIM_MAX_PWM) pr =  PRIM_MAX_PWM;
+        if (pr < -PRIM_MAX_PWM) pr = -PRIM_MAX_PWM;
+
+        motor_cmd_t c = {pl, pr};
+        xQueueOverwrite(s_motor_q, &c);
+        if (now_ms() - t0 > PRIM_SAFETY_MS) break;
+        vTaskDelay(pdMS_TO_TICKS(PRIM_TICK_MS));
+    }
+    motor_cmd_t stop = {0, 0};
+    xQueueOverwrite(s_motor_q, &stop);
+}
+
+static void primitive_task(void *arg)
+{
+    prim_cmd_t pc;
+    while (1) {
+        if (xQueueReceive(s_prim_q, &pc, portMAX_DELAY) != pdTRUE) continue;
+        s_primitive_active = true;
+        if (pc.kind == 0) run_turn(pc.value);
+        else              run_fwd(pc.value);
+        s_primitive_active = false;
+
+        struct sockaddr_in scada;
+        taskENTER_CRITICAL(&s_scada_mux);
+        scada = s_scada_addr;
+        taskEXIT_CRITICAL(&s_scada_mux);
+        if (scada.sin_addr.s_addr != 0) {
+            const char *msg = (pc.kind == 0) ? "STATUS:TURN_DONE\n" : "STATUS:FWD_DONE\n";
+            sendto(s_sock, msg, strlen(msg), 0, (struct sockaddr *)&scada, sizeof(scada));
         }
     }
 }
@@ -874,6 +1028,7 @@ void app_main(void)
     ESP_LOGI(TAG, "=== Bot S3 (control) booting ===");
 
     s_motor_q = xQueueCreate(1, sizeof(motor_cmd_t));
+    s_prim_q  = xQueueCreate(1, sizeof(prim_cmd_t));
     motors_init();
     encoders_init();
 
@@ -923,8 +1078,9 @@ void app_main(void)
         ESP_LOGW(TAG, "TOF task not started — VL53L0X not detected");
     }
 
-    xTaskCreate(watchdog_task, "watchdog", 1024, NULL, 7, NULL);
-    xTaskCreate(repair_task,   "repair",   2048, NULL, 5, &s_repair_task_handle);
+    xTaskCreate(watchdog_task,  "watchdog", 1024, NULL, 7, NULL);
+    xTaskCreate(repair_task,    "repair",   2048, NULL, 5, &s_repair_task_handle);
+    xTaskCreate(primitive_task, "prim",     4096, NULL, 6, NULL);
 
     ESP_LOGI(TAG, "All tasks started — ready");
 }
