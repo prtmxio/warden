@@ -89,9 +89,38 @@ INSPECT_BACKOFF_HOLD_TICKS = 60   # ticks (×50 ms ≈ 3 s) — on reaching the 
                                   # A laggy S3 (1-2 fps) can confirm a few hundred ms after the band
                                   # is walked; without this grace the search quit ~250 ms too early
                                   # and threw away a real FAULT read.
-MOCK_REPAIR_CM   = 3.5    # cm — mock repair: nudge this far forward from the 10 cm dock, then back
+MOCK_REPAIR_CM   = 3.5    # cm — legacy fixed nudge; superseded by the TOF-driven nose-in below
+REPAIR_CONTACT_MM = 25.0  # mm — mock repair noses forward to this gap from the box face (off the
+                          #      live TOF at dock), does the repair, then reverses the SAME distance
+                          #      so it ends back at the docking stand-off. Raise if it taps the box.
 APPROACH_YAW_KP  = 2.0    # P gain — hold perpendicular heading while creeping forward
 ALIGN_YAW_KP     = 1.5    # P gain — rotate to perpendicular / face the centerline
+
+# ── Encoder closed-loop motion primitives ─────────────────────────────────────
+# The overhead ArUco heading is too noisy to servo on directly, and open-loop LEFT/RIGHT
+# PWM can't travel straight (the two wheels drift → the bot skids). So instead of streaming
+# /cmd_vel, control_node computes a GOAL from the camera while the bot is stopped, then fires
+# ONE firmware primitive — TURN:<deg> (exact rotation on differential ticks) or FWD:<mm>
+# (straight drive that equalises the two wheels' travel) — waits for STATUS:TURN_DONE /
+# STATUS:FWD_DONE, re-measures, and repeats. Firmware does the tick math; these govern SCADA.
+MOVE_PRIMITIVES  = True   # True → primitive-based align/dock/back/repair; False → legacy cmd_vel servo
+TURN_TOL_DEG     = 0.8    # deg — final heading band. ~0.4° is one differential encoder tick at this
+                         #       wheel separation, so this is near the hardware floor; tighter can't settle.
+HEADING_SAMPLES  = 3      # fresh /bot_px frames collected (bot stopped) → circular median = the goal.
+                         #       The phone pose arrives ~1 Hz, so each sample costs ~1 s — 3 still
+                         #       rejects a lone outlier while cutting a measure round from ~5 s to ~2 s.
+LAT_SAMPLES      = 3      # fresh frames for the lateral-offset median
+SETTLE_S         = 0.5    # s — hold still after a STOP before sampling, so the camera pose is current
+PRIM_TIMEOUT_S   = 5.0    # s — if STATUS:*_DONE never arrives, re-measure and reissue (lost packet)
+LAT_PX_PER_MM    = 0.70   # overhead px per mm of bot travel — CALIBRATED from a run whose centring
+                         #       overshot ~2.35x at the old 0.30 (it drove far too far and zig-zagged
+                         #       across the centerline). 0.70 makes one round land near the centerline.
+LAT_GAIN         = 0.6    # fraction of the measured lateral offset to correct per round. <1 damps the
+                         #       loop so any residual scale error CONVERGES instead of oscillating —
+                         #       kills the "lots of big 90-deg corrections" zig-zag. Converges for
+                         #       scale errors up to ~1/0.6 = 1.67x; smaller moves also feel gentler.
+DOCK_STEP_MM     = 15.0   # mm — max straight FWD step per docking iteration (re-reads TOF between steps)
+MOCK_REPAIR_MM   = MOCK_REPAIR_CM * 10.0
 
 # ── Arena-free navigation (pixel-space visual servoing) ───────────────────────
 # When True, vision_node skips the corner-marker homography entirely and control_node
@@ -159,7 +188,7 @@ BOX_HSV_HI   = (21, 121, 255)
 BOX_MIN_AREA = 800
 
 # IPs — update before first run, or override via environment variables
-PHONE_STREAM_URL  = os.environ.get("PHONE_STREAM_URL", "http://100.111.205.247:8080/video")
+PHONE_STREAM_URL  = os.environ.get("PHONE_STREAM_URL", "http://10.86.116.146:8080/video")
 S3_STREAM_URL     = os.environ.get("S3_STREAM_URL", "http://esp-cam.local:81/stream")
 BOT_IP            = os.environ.get("BOT_IP", "esp-bot.local")
 BOT_PORT          = int(os.environ.get("BOT_PORT", "4210"))

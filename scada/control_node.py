@@ -71,6 +71,8 @@ from arena_config import (
     ODOM_FUSION, ODOM_STALE_S, FUSE_MIN_TRANS_M, FUSE_MIN_ROT_RAD,
     FUSE_FORGET, FUSE_MIN_DET, FUSE_MIN_SAMPLES, PX_ANG_MAX,
     SNAPSHOT_WINDOW, SNAPSHOT_MIN_SEEN,
+    MOVE_PRIMITIVES, TURN_TOL_DEG, HEADING_SAMPLES, LAT_SAMPLES, SETTLE_S,
+    PRIM_TIMEOUT_S, LAT_PX_PER_MM, LAT_GAIN, DOCK_STEP_MM, MOCK_REPAIR_MM, REPAIR_CONTACT_MM,
 )
 
 WATCHDOG_INTERVAL = WATCHDOG_MS / 1000.0 * 0.8   # send STOP slightly faster than 500 ms
@@ -89,6 +91,28 @@ NAV_TOF_SAFETY_MM = 150.0   # mm — hard TOF floor during the drive; never push
 def _wrap(a: float) -> float:
     """Wrap an angle to (-π, π]."""
     return math.atan2(math.sin(a), math.cos(a))
+
+
+def _circ_median(angles):
+    """Robust central angle of a list (rad): component-wise median of the unit vectors, then
+    atan2. Median (not mean) so an occasional flipped/garbage ArUco heading can't drag the result."""
+    if not angles:
+        return None
+    xs = sorted(math.cos(a) for a in angles)
+    ys = sorted(math.sin(a) for a in angles)
+    n = len(xs)
+    mx = xs[n // 2] if n % 2 else 0.5 * (xs[n // 2 - 1] + xs[n // 2])
+    my = ys[n // 2] if n % 2 else 0.5 * (ys[n // 2 - 1] + ys[n // 2])
+    return math.atan2(my, mx)
+
+
+def _median(vals):
+    """Plain scalar median of a list, or None if empty."""
+    if not vals:
+        return None
+    s = sorted(vals)
+    n = len(s)
+    return s[n // 2] if n % 2 else 0.5 * (s[n // 2 - 1] + s[n // 2])
 
 
 def _camera_x(x: float, yaw: float) -> float:
@@ -196,6 +220,7 @@ class ControlNode(Node):
         self._align_settle_ticks = 0         # motors-off settle remaining after the last pulse
         self._align_stage = "heading"        # staged aligner: heading → lat_check → lat_turn → lat_drive
         self._align_round = 0                # heading+lateral re-centre rounds done (safety cap)
+        self._align_blind = 0                # consecutive align windows with no readable heading
         self._lat_sign = 1.0                 # sign of the lateral offset currently being corrected
         self._inspect_retries = 0            # failed full-view reads for current box
         self._inspect_timer  = None          # 5 s timeout waiting for ArUco from bot_cam
@@ -216,6 +241,22 @@ class ControlNode(Node):
         self._backoff_stream_dead = False    # True if a step was ever held for a stale stream
         self._backoff_stale_logged = False
         self._last_cam_alive = 0.0           # monotonic time of the last /bot_cam_status heartbeat
+
+        # --- encoder motion primitives (MOVE_PRIMITIVES) ---
+        self._prim_pending = False           # a TURN/FWD is executing on the firmware; suppress cmd_vel
+        self._prim_kind    = None            # "TURN" | "FWD" of the in-flight primitive
+        self._prim_done_cb = None            # continuation to run on STATUS:*_DONE (or timeout)
+        self._prim_deadline = 0.0            # monotonic deadline; past it, treat the primitive as done
+        self._samp_timer   = None            # drives stationary measurement sampling
+        self._samp         = None            # active sampler state dict
+        self._approach_timer = None          # drives the primitive TOF approach
+        self._approach_target = 0.0          # mm — TOF distance this approach is creeping toward
+        self._approach_settling = False      # backing off to the readable dock gap
+        self._approach_fwd_mm = 0.0          # mm driven forward this approach (safety cap)
+        self._backoff_done_mm = 0.0          # mm backed off so far during inspect back-off
+        self._mock_stage   = None            # "forward" | "reverse" during primitive mock repair
+        self._repair_fwd_mm = 0.0            # mm the repair nosed forward (reverse mirrors it exactly)
+        self._repair_remaining = 0.0         # mm left in the current stepped nose-in / back-out
 
         # watchdog timer fires every 400 ms; only sends STOP during AWAITING_HUMAN
         self._watchdog_timer = self.create_timer(WATCHDOG_INTERVAL, self._watchdog_tick)
@@ -242,26 +283,37 @@ class ControlNode(Node):
             self._start_align()
 
         elif new_state == FSM.APPROACH_SCAN:
-            self.get_logger().info(f"Approach-scan: TOF creep to {SCAN_STOP_MM:.0f} mm")
+            if MOVE_PRIMITIVES and ARENA_FREE:
+                self._start_approach_prim(SCAN_STOP_MM)
+            else:
+                self.get_logger().info(f"Approach-scan: TOF creep to {SCAN_STOP_MM:.0f} mm")
 
         elif new_state == FSM.APPROACH_DOCK:
             self._dock_settling = False
-            if USE_TOF:
-                self.get_logger().info(f"Approach-dock: TOF creep to {DOCK_STOP_MM:.0f} mm")
-            else:
+            if not USE_TOF:
                 # No usable TOF to creep the last few cm — repair from the scan position.
                 self.get_logger().info("No TOF — repairing from scan distance")
                 self._transition(FSM.REPAIRING)
+            elif MOVE_PRIMITIVES and ARENA_FREE:
+                self._start_approach_prim(DOCK_STOP_MM)
+            else:
+                self.get_logger().info(f"Approach-dock: TOF creep to {DOCK_STOP_MM:.0f} mm")
 
         elif new_state == FSM.INSPECTING:
             self._start_inspection()
             if ARENA_FREE and INSPECT_BACKOFF:
-                self._start_inspect_backoff()
+                if MOVE_PRIMITIVES:
+                    self._start_inspect_backoff_prim()
+                else:
+                    self._start_inspect_backoff()
             elif ARENA_FREE and INSPECT_SWEEP:
                 self._start_inspect_sweep()
 
         elif new_state == FSM.REPAIRING:
-            self._start_mock_repair()
+            if MOVE_PRIMITIVES and ARENA_FREE:
+                self._start_mock_repair_prim()
+            else:
+                self._start_mock_repair()
 
         elif new_state == FSM.MISSION_COMPLETE:
             self.get_logger().info("=== MISSION COMPLETE ===")
@@ -770,6 +822,9 @@ class ControlNode(Node):
         self._align_settle_ticks = 0
         self._align_stage = "heading"
         self._align_round = 0
+        if ARENA_FREE and MOVE_PRIMITIVES:
+            self._start_align_prim()
+            return
         if ARENA_FREE:
             desired = self._box_desired_hdg(self._current_beacon)
             des_deg = math.degrees(desired) if desired is not None else 0.0
@@ -1041,6 +1096,8 @@ class ControlNode(Node):
     # ------------------------------------------------------------------ approach
     def _on_tof(self, msg: Range):
         self._tof_mm = msg.range * 1000.0
+        if MOVE_PRIMITIVES and ARENA_FREE:
+            return   # the primitive approach machine reads _tof_mm itself; it owns the motors
         if not USE_TOF:
             return   # TOF unreliable — approach/dock are driven by the pixel gap instead
         if self._state not in (FSM.APPROACH_SCAN, FSM.APPROACH_DOCK):
@@ -1356,6 +1413,8 @@ class ControlNode(Node):
         self._cancel_inspect_timer()
         self._stop_inspect_sweep()
         self._stop_inspect_backoff()
+        self._abort_primitive()
+        self._stop_sampling()
         self._cmd_vel_pub.publish(Twist())   # halt the pan the instant the marker is read
         # Identity is discovered here — the overhead camera only knew this box as a
         # position; the bot's S3 camera reads the actual ArUco ID at the box face.
@@ -1368,6 +1427,8 @@ class ControlNode(Node):
             return
         self._stop_inspect_sweep()
         self._stop_inspect_backoff()
+        self._abort_primitive()
+        self._stop_sampling()
         self._cmd_vel_pub.publish(Twist())
         self._inspect_retries = 0
         key = self._result_key()
@@ -1588,8 +1649,340 @@ class ControlNode(Node):
         self._is_repair_phase = False   # back to normal inspect routing for the next box
         self._transition(FSM.IDLE)
 
+    # ------------------------------------------------------------------ motion primitives
+    def _send_primitive(self, kind: str, value: float, on_done):
+        """Fire one encoder closed-loop primitive on the firmware and run `on_done` when it reports
+        STATUS:<kind>_DONE. While it is in flight, SCADA publishes NO /cmd_vel — the firmware owns the
+        motors for the duration — so the two never fight over the motor queue. `on_done` may be None."""
+        self._prim_kind     = kind
+        self._prim_done_cb  = on_done
+        self._prim_pending  = True
+        self._prim_deadline = time.monotonic() + PRIM_TIMEOUT_S
+        self._send_cmd(f"{kind}:{value:.1f}")
+
+    def _primitive_done(self, timed_out: bool = False):
+        if not self._prim_pending:
+            return
+        self._prim_pending = False
+        cb = self._prim_done_cb
+        self._prim_done_cb = None
+        if timed_out:
+            self.get_logger().warn(f"primitive {self._prim_kind} timed out — continuing")
+        if cb is not None:
+            cb()
+
+    def _abort_primitive(self):
+        """Drop in-flight primitive bookkeeping when a phase is torn down. A STATUS:*_DONE that
+        arrives afterwards is ignored (guard in _on_status), so no stale continuation fires."""
+        self._prim_pending = False
+        self._prim_done_cb = None
+
+    # ------------------------------------------------------------------ stationary sampling
+    def _start_sampling(self, getter, n, on_result):
+        """Hold the bot still, then collect `n` values from getter() on distinct fresh camera frames
+        and hand the list to on_result(). Measuring only while stopped means the overhead marker is
+        sharp (no motion blur) and the median rejects the occasional dropout/flip — this is what makes
+        the computed goal trustworthy enough to drive a one-shot encoder primitive."""
+        self._stop_sampling()
+        self._samp = {
+            "getter": getter, "n": n, "on_result": on_result, "vals": [], "last_seq": -1,
+            "settle_until": time.monotonic() + SETTLE_S,
+            "deadline":     time.monotonic() + SETTLE_S + 4.0,
+        }
+        self._samp_timer = self.create_timer(0.02, self._sample_tick)
+
+    def _sample_tick(self):
+        s = self._samp
+        if s is None:
+            self._stop_sampling()
+            return
+        now = time.monotonic()
+        self._cmd_vel_pub.publish(Twist())   # keep still → sharp frames, firmware watchdog fed
+        if now < s["settle_until"]:
+            return
+        if self._bot_px is not None and self._px_seq != s["last_seq"]:
+            s["last_seq"] = self._px_seq
+            v = s["getter"]()
+            if v is not None:
+                s["vals"].append(v)
+        if len(s["vals"]) >= s["n"] or now >= s["deadline"]:
+            cb, vals = s["on_result"], s["vals"]
+            self._stop_sampling()
+            cb(vals)
+
+    def _stop_sampling(self):
+        if self._samp_timer is not None:
+            self._samp_timer.cancel()
+            self.destroy_timer(self._samp_timer)
+            self._samp_timer = None
+        self._samp = None
+
+    # ------------------------------------------------------------------ primitive alignment
+    def _start_align_prim(self):
+        """Measure-while-stopped → one TURN/FWD → re-check, on encoder primitives. Ends BOTH square-on
+        (heading within TURN_TOL_DEG) and centred on the box forward axis (within LAT_TOL_PX)."""
+        self._stop_sampling()
+        self._abort_primitive()
+        self._align_round = 0
+        self._align_blind = 0
+        desired = self._box_desired_hdg(self._current_beacon)
+        des_deg = math.degrees(desired) if desired is not None else 0.0
+        self.get_logger().info(
+            f"Aligning (primitives): face box {self._box_label()} "
+            f"(desired hdg={des_deg:.1f}°, target ±{TURN_TOL_DEG:.1f}°)"
+        )
+        self._align_measure_heading()
+
+    def _align_measure_heading(self):
+        if self._state != FSM.ALIGNING:
+            return
+        self._start_sampling(self._heading_alignment_err, HEADING_SAMPLES, self._align_on_heading)
+
+    def _align_on_heading(self, errs):
+        if self._state != FSM.ALIGNING:
+            return
+        err = _circ_median(errs)
+        if err is None:
+            self._align_blind += 1
+            if self._align_blind >= 5:
+                self.get_logger().warn(
+                    f"Box {self._box_label()} heading unreadable after {self._align_blind} windows "
+                    f"— proceeding best-effort"
+                )
+                self._finish_align(0.0)
+                return
+            self._align_measure_heading()   # bot marker unseen this window — look again
+            return
+        self._align_blind = 0
+        if abs(err) <= math.radians(TURN_TOL_DEG):
+            self._align_measure_lat()
+            return
+        self._send_primitive("TURN", math.degrees(err) * PX_TURN_SIGN, self._align_measure_heading)
+
+    def _align_measure_lat(self):
+        if self._state != FSM.ALIGNING:
+            return
+        self._start_sampling(self._lateral_box_err, LAT_SAMPLES, self._align_on_lat)
+
+    def _align_on_lat(self, lats):
+        if self._state != FSM.ALIGNING:
+            return
+        lat = _median(lats) or 0.0
+        if abs(lat) <= LAT_TOL_PX:
+            self._finish_align(self._heading_alignment_err() or 0.0)
+            return
+        if self._align_round >= ALIGN_MAX_ROUNDS:
+            self.get_logger().warn(
+                f"Box {self._box_label()} not centred after {ALIGN_MAX_ROUNDS} rounds "
+                f"(lateral {lat:.0f}px) — proceeding best-effort"
+            )
+            self._finish_align(self._heading_alignment_err() or 0.0)
+            return
+        self._align_round += 1
+        self._lat_sign = 1.0 if lat > 0 else -1.0
+        self.get_logger().info(
+            f"Centring on box {self._box_label()}: lateral offset {lat:.0f}px "
+            f"(round {self._align_round}/{ALIGN_MAX_ROUNDS})"
+        )
+        # Turn to face the sideways-drive heading that kills the offset, drive the measured offset
+        # across (px→mm via LAT_PX_PER_MM), then return to the heading stage — which turns square-on
+        # again and re-checks the offset. The re-check loop absorbs any LAT_PX_PER_MM scale error.
+        tgt = self._lat_drive_hdg()
+        cur = self._cur_px()
+        if tgt is None or cur is None:
+            self._align_measure_heading()
+            return
+        turn_deg = math.degrees(_wrap(tgt - cur[2])) * PX_TURN_SIGN
+        drive_mm = LAT_GAIN * abs(lat) / LAT_PX_PER_MM
+        self._send_primitive(
+            "TURN", turn_deg,
+            lambda: self._send_primitive("FWD", drive_mm, self._align_measure_heading),
+        )
+
+    # ------------------------------------------------------------------ primitive approach (scan/dock)
+    def _start_approach_prim(self, target_mm: float):
+        """Creep to `target_mm` TOF in straight FWD steps, re-reading the TOF between each (so TOF
+        noise/slip can't accumulate). Straight steps mean the bot stays square-on and centred — no
+        skid carrying the camera off the box face."""
+        self._abort_primitive()
+        self._approach_target   = target_mm
+        self._approach_settling = False
+        self._approach_fwd_mm   = 0.0
+        self.get_logger().info(
+            f"Approach (primitives): straight FWD → {target_mm:.0f} mm for box {self._box_label()}"
+        )
+        self._approach_step()
+
+    def _approach_step(self):
+        if self._state not in (FSM.APPROACH_SCAN, FSM.APPROACH_DOCK):
+            return
+        tof = self._tof_mm
+        tof_sane = 30.0 <= tof < 2000.0
+
+        if self._approach_settling:
+            # Dock settle-back: reverse straight until the TOF shows a reliable gap >= DOCK_STOP_MM,
+            # so every run ends at the same readable ~10 cm stand-off no matter how the stop triggered.
+            if tof_sane and tof >= DOCK_STOP_MM:
+                self._send_cmd("STOP")
+                self._approach_settling = False
+                self.get_logger().info(
+                    f"Settled at {tof:.0f} mm — readable gap for box {self._box_label()} → "
+                    f"{'repair' if self._is_repair_phase else 'inspect'}"
+                )
+                self._finish_dock()
+            else:
+                self._send_primitive("FWD", -DOCK_STEP_MM, self._approach_step)
+            return
+
+        reached = tof_sane and tof <= (self._approach_target + DOCK_ANTICIPATE_MM)
+        too_close = (not tof_sane) and tof < 30.0           # saturated TOF dead zone → already in
+        capped = self._approach_fwd_mm >= 400.0             # drove far without seeing the box — bail
+
+        if reached or too_close or capped:
+            self._send_cmd("STOP")
+            if capped and not reached:
+                self.get_logger().warn(
+                    f"Approach cap hit for box {self._box_label()} (TOF {tof:.0f} mm) — proceeding"
+                )
+            if self._state == FSM.APPROACH_SCAN:
+                self.get_logger().info(
+                    f"Scan distance for box {self._box_label()} (TOF {tof:.0f} mm) → INSPECTING"
+                )
+                self._transition(FSM.INSPECTING)
+            elif DOCK_SETTLE and not too_close:
+                self.get_logger().info(
+                    f"Dock reached for box {self._box_label()} (TOF {tof:.0f} mm) — settling"
+                )
+                self._approach_settling = True
+                self._approach_step()
+            elif DOCK_SETTLE:
+                self._approach_settling = True
+                self._approach_step()
+            else:
+                self._finish_dock()
+            return
+
+        togo = (tof - self._approach_target) if tof_sane else DOCK_STEP_MM
+        step = min(DOCK_STEP_MM, max(2.0, togo - DOCK_ANTICIPATE_MM)) if tof_sane else DOCK_STEP_MM
+        self._approach_fwd_mm += step
+        self._send_primitive("FWD", step, self._approach_step)
+
+    # ------------------------------------------------------------------ primitive inspect back-off
+    def _start_inspect_backoff_prim(self):
+        self._stop_inspect_backoff()
+        self._backoff_done_mm = 0.0
+        self._backoff_settle  = INSPECT_BACKOFF_SETTLE_TICKS
+        self._backoff_hold    = INSPECT_BACKOFF_HOLD_TICKS
+        self._backoff_stream_dead = False
+        self._backoff_stale_logged = False
+        self.get_logger().info(
+            f"Inspect back-off (primitives) for box {self._box_label()}: straight FWD "
+            f"-{INSPECT_BACKOFF_STEP_MM:.0f} mm steps out to {INSPECT_BACKOFF_MAX_MM:.0f} mm"
+        )
+        self._backoff_timer = self.create_timer(0.05, self._inspect_backoff_tick_prim)
+
+    def _inspect_backoff_tick_prim(self):
+        # Look-then-step on primitives: settle motors-off for a sharp S3 frame, then reverse one
+        # straight increment. _on_aruco_detected halts this the instant a marker confirms.
+        if self._state != FSM.INSPECTING:
+            self._stop_inspect_backoff()
+            return
+        if self._prim_pending:
+            return   # a back-off FWD step is running on the firmware
+        if (time.monotonic() - self._last_cam_alive) > INSPECT_STREAM_STALE_S:
+            self._backoff_stream_dead = True
+            if not self._backoff_stale_logged:
+                self.get_logger().warn(
+                    f"Inspection paused for box {self._box_label()} — S3 stream stale "
+                    f"(no frames >{INSPECT_STREAM_STALE_S:.0f}s); holding until it recovers"
+                )
+                self._backoff_stale_logged = True
+            self._cmd_vel_pub.publish(Twist())
+            return
+        self._backoff_stale_logged = False
+        if self._backoff_settle > 0:
+            self._backoff_settle -= 1
+            self._cmd_vel_pub.publish(Twist())
+            return
+        if self._backoff_done_mm >= INSPECT_BACKOFF_MAX_MM:
+            if self._backoff_hold > 0:
+                self._backoff_hold -= 1
+                self._cmd_vel_pub.publish(Twist())
+                return
+            self._inspect_miss("backed off through readable band + grace, no marker")
+            return
+        self._backoff_done_mm += INSPECT_BACKOFF_STEP_MM
+        self._backoff_settle = INSPECT_BACKOFF_SETTLE_TICKS
+        self._send_primitive("FWD", -INSPECT_BACKOFF_STEP_MM, None)
+
+    # ------------------------------------------------------------------ primitive mock repair
+    def _start_mock_repair_prim(self):
+        self._cancel_repair_timer()
+        self._mock_stage = "forward"
+        # Nose right up to the box off the live TOF gap (leave REPAIR_CONTACT_MM clearance), rather
+        # than a fixed nudge that stops well short. Reverse the SAME distance afterward so the bot
+        # ends back at the docking stand-off. Fall back to the fixed nudge if the TOF is unreadable.
+        tof = self._tof_mm
+        tof_sane = tof is not None and 0 < tof < 2000
+        if tof_sane:
+            self._repair_fwd_mm = max(10.0, tof - REPAIR_CONTACT_MM)
+        else:
+            self._repair_fwd_mm = MOCK_REPAIR_MM
+        self.get_logger().info(
+            f"Mock repair (primitives) at box {self._box_label()}: nose in {self._repair_fwd_mm:.0f} mm "
+            f"(TOF {tof if tof_sane else 'n/a'}) in {DOCK_STEP_MM:.0f} mm steps, pause, then exact reverse"
+        )
+        # Nose in / back out in small DOCK_STEP_MM chunks rather than one big FWD: a long single
+        # primitive saturates the P-term to max PWM and launches hard (the jerk). Short steps stay in
+        # the gentle P-region so the bot creeps up to the box and backs off smoothly.
+        self._repair_remaining = self._repair_fwd_mm
+        self._mock_repair_forward_step()
+
+    def _mock_repair_forward_step(self):
+        if self._state != FSM.REPAIRING:
+            return
+        if self._repair_remaining <= 0.5:
+            self._mock_repair_after_forward()
+            return
+        step = min(DOCK_STEP_MM, self._repair_remaining)
+        self._repair_remaining -= step
+        self._send_primitive("FWD", step, self._mock_repair_forward_step)
+
+    def _mock_repair_after_forward(self):
+        if self._state != FSM.REPAIRING:
+            return
+        self._cancel_repair_timer()
+        self._repair_timer = self.create_timer(0.5, self._mock_repair_reverse)   # brief pause
+
+    def _mock_repair_reverse(self):
+        self._cancel_repair_timer()
+        if self._state != FSM.REPAIRING:
+            return
+        self._repair_remaining = self._repair_fwd_mm
+        self._mock_repair_reverse_step()
+
+    def _mock_repair_reverse_step(self):
+        if self._state != FSM.REPAIRING:
+            return
+        if self._repair_remaining <= 0.5:
+            self._mock_repair_done()
+            return
+        step = min(DOCK_STEP_MM, self._repair_remaining)
+        self._repair_remaining -= step
+        self._send_primitive("FWD", -step, self._mock_repair_reverse_step)
+
+    def _mock_repair_done(self):
+        if self._state != FSM.REPAIRING:
+            return
+        self._send_cmd("STOP")
+        self._mock_stage = None
+        self._finish_repair()
+
     def _on_status(self, msg: String):
         status = msg.data.strip()
+        if status in ("STATUS:TURN_DONE", "STATUS:FWD_DONE"):
+            self._primitive_done()
+            return
         self.get_logger().info(f"Bot status: {status}")
 
         if status == "STATUS:REPAIRED" and self._state == FSM.REPAIRING:
@@ -1602,6 +1995,10 @@ class ControlNode(Node):
 
     # ------------------------------------------------------------------ watchdog
     def _watchdog_tick(self):
+        # A primitive whose STATUS:*_DONE never arrived (lost packet / firmware safety timeout) would
+        # otherwise wedge the FSM — resume its continuation once the deadline passes.
+        if self._prim_pending and time.monotonic() > self._prim_deadline:
+            self._primitive_done(timed_out=True)
         if self._state == FSM.AWAITING_HUMAN:
             self._send_cmd("STOP")
 
