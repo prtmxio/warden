@@ -188,7 +188,7 @@ BOX_HSV_HI   = (21, 121, 255)
 BOX_MIN_AREA = 800
 
 # IPs — update before first run, or override via environment variables
-PHONE_STREAM_URL  = os.environ.get("PHONE_STREAM_URL", "http://10.86.116.146:8080/video")
+PHONE_STREAM_URL  = os.environ.get("PHONE_STREAM_URL", "http://10.86.116.184:8080/video")
 S3_STREAM_URL     = os.environ.get("S3_STREAM_URL", "http://esp-cam.local:81/stream")
 BOT_IP            = os.environ.get("BOT_IP", "esp-bot.local")
 BOT_PORT          = int(os.environ.get("BOT_PORT", "4210"))
