@@ -133,12 +133,6 @@ Every section below is cross-referenced to the source file that implements it.
 | 10 | VL53L0X TOF | 0–2 m laser, I2C | Docking distance |
 | 11 | 2S 18650 pack | 7.4 V nominal | Power source |
 | 12 | Mini-360 buck | → 5.0 V | Logic rail |
-| 13 | SPDT switch | — | Kill switch |
-| 14 | 100 nF caps ×4 | — | Encoder channel noise filter |
-| 15 | M3 standoffs (~5 cm) | — | Raises bot ArUco (ID 5) above the chassis |
-
-An indicator LED on the controller (GPIO47) and the camera-board LED (GPIO48) are wired as
-status indicators.
 
 ### 3.2 Controller (ESP32-S3 "bot brain") pin map
 
@@ -154,7 +148,6 @@ From `bot_code/esp_bot/main/main.c`.
 | Left encoder C1 / C2 | 21 / 12 | C1 = interrupt (rising edge), C2 = direction sample |
 | Right encoder C1 / C2 | 18 / 15 | " |
 | VL53L0X `SDA` / `SCL` | 6 / 7 | I2C0 @ 10 kHz, internal pull-ups enabled |
-| Indicator LED | 47 | repair-cycle blink |
 | UART1 TX → inspector | 2 | forwards `SCAN\n` to the camera board |
 
 Motor direction logic (`set_motor_side`): `speed>0` → IN1=1, IN2=0; `speed<0` → IN1=0,
@@ -652,10 +645,9 @@ config, selected when `INSPECT_BACKOFF` is disabled.
    box.
 
 **Firmware repair cycle** also exists on the controller (`repair_task`): on `REPAIR_MODE` it
-drives forward until `REPAIR_STOP` (or a safety timeout), records the forward time, blinks the
-indicator LED `REPAIR_INDICATOR_CYCLES` (6) times, reverses for the same duration, and replies
-`STATUS:REPAIRED`. `control_node` handles `STATUS:REPAIRED` identically whichever path produced
-it.
+drives forward until `REPAIR_STOP` (or a safety timeout), records the forward time, reverses for
+the same duration, and replies `STATUS:REPAIRED`. `control_node` handles `STATUS:REPAIRED`
+identically whichever path produced it.
 
 ---
 
@@ -799,7 +791,7 @@ INSPECT_STREAM_STALE_S = 1.0, INSPECT_SAFETY_S = 30.0
 **Repair**
 ```
 REPAIR_CONTACT_MM = 25 (nose-in clearance), MOCK_REPAIR_CM = 3.5 (fixed-nudge fallback)
-firmware: REPAIR_FWD_SPEED = 90, REPAIR_FWD_SAFETY_MS = 5000, REPAIR_INDICATOR_CYCLES = 6
+firmware: REPAIR_FWD_SPEED = 90, REPAIR_FWD_SAFETY_MS = 5000
 ```
 
 **Odom fusion**
