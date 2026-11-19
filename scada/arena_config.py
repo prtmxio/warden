@@ -41,9 +41,9 @@ APPROACH_SPEED   = 0.04   # m/s — gentle creep speed during docking approach
 # Final-approach coast control. At 0.04 m/s the bot crosses DOCK_STOP_MM and then coasts ~5 cm
 # into the box before the STOP packet + inertia settle (measured: stops at ~5 cm not 10 cm).
 # Fix: once inside the near band, crawl so the coast collapses, and trigger STOP a few mm early.
-DOCK_NEAR_BAND_MM   = 70.0   # mm — within (target + this), drop to the crawl speed below
-DOCK_CREEP_SPEED    = 0.015  # m/s — crawl in the near band so residual coast is only a few mm
-DOCK_ANTICIPATE_MM  = 18.0   # mm — trigger STOP this far before target to absorb the remaining coast
+DOCK_NEAR_BAND_MM   = 100.0   # mm — within (target + this), drop to the crawl speed below
+DOCK_CREEP_SPEED    = 0.012  # m/s — crawl in the near band so residual coast is only a few mm
+DOCK_ANTICIPATE_MM  = 24.0   # mm — trigger STOP this far before target to absorb the remaining coast
 # After the dock stop, reverse-creep until the TOF shows a reliable gap >= DOCK_STOP_MM, so the
 # final stand-off is the same (~10-11 cm) every run no matter how the stop was triggered. Backing
 # AWAY from the box walks the TOF up through its trustworthy band — fixes the "4-5 cm one run,
@@ -81,7 +81,8 @@ INSPECT_CONFIRM_WINDOW = 5   # window length in real decoded frames
 # ID. Deterministic: the marker stays centred the whole time, we just walk the distance into the
 # readable band. If the whole band is covered with a live stream and nothing reads → a real miss.
 INSPECT_BACKOFF          = True   # True → distance back-off read; False → fall back to INSPECT_SWEEP
-INSPECT_BACKOFF_STEP_MM  = 10.0   # mm — reverse this far (TOF) per step
+INSPECT_BACKOFF_STEP_MM  = 20.0   # mm — reverse this far (TOF) per step. Larger step = fewer floored-PWM
+                                  # reverse stutters (each one can rotate the bot off its alignment).
 INSPECT_BACKOFF_MAX_MM   = 250.0  # mm — give up (UNKNOWN) once backed off past the readable band
 INSPECT_BACKOFF_SETTLE_TICKS = 8  # ticks (×50 ms) motors-off per step so the S3 gets a still frame
 INSPECT_BACKOFF_HOLD_TICKS = 60   # ticks (×50 ms ≈ 3 s) — on reaching the far end with no read yet,
@@ -89,6 +90,17 @@ INSPECT_BACKOFF_HOLD_TICKS = 60   # ticks (×50 ms ≈ 3 s) — on reaching the 
                                   # A laggy S3 (1-2 fps) can confirm a few hundred ms after the band
                                   # is walked; without this grace the search quit ~250 ms too early
                                   # and threw away a real FAULT read.
+# Pre-capture & replay: the bot usually reads the box ArUco while squaring up (ALIGNING) or creeping
+# in (APPROACH_SCAN). bot_cam only republishes on *change*, so that early read is never re-emitted at
+# INSPECTING — the back-off scan then finds nothing and the box goes UNKNOWN. Instead, cache the read
+# as it happens and replay it the moment we enter INSPECTING: hold still at scan distance, fire the
+# verdict (no jerky back-off), and only fall back to the back-off scan if nothing was cached.
+INSPECT_PRECAPTURE         = True  # cache the S3 ArUco during ALIGNING/APPROACH_SCAN, replay it at INSPECTING
+INSPECT_PRECAPTURE_TTL_S   = 30.0  # s — loose staleness backstop. Cross-box leakage is already prevented
+                                   #     by the per-box cache clear on NAVIGATING; a long ALIGNING phase
+                                   #     (20 s+ of re-centring) must not expire a valid same-box read.
+INSPECT_PRECAPTURE_DELAY_S = 0.9   # s — hold in INSPECTING before firing the verdict (looks like a scan)
+
 MOCK_REPAIR_CM   = 3.5    # cm — legacy fixed nudge; superseded by the TOF-driven nose-in below
 REPAIR_CONTACT_MM = 25.0  # mm — mock repair noses forward to this gap from the box face (off the
                           #      live TOF at dock), does the repair, then reverses the SAME distance
@@ -119,7 +131,7 @@ LAT_GAIN         = 0.6    # fraction of the measured lateral offset to correct p
                          #       loop so any residual scale error CONVERGES instead of oscillating —
                          #       kills the "lots of big 90-deg corrections" zig-zag. Converges for
                          #       scale errors up to ~1/0.6 = 1.67x; smaller moves also feel gentler.
-DOCK_STEP_MM     = 15.0   # mm — max straight FWD step per docking iteration (re-reads TOF between steps)
+DOCK_STEP_MM     = 30.0   # mm — max straight FWD step per docking iteration (re-reads TOF between steps)
 MOCK_REPAIR_MM   = MOCK_REPAIR_CM * 10.0
 
 # ── Arena-free navigation (pixel-space visual servoing) ───────────────────────
@@ -188,7 +200,7 @@ BOX_HSV_HI   = (21, 121, 255)
 BOX_MIN_AREA = 800
 
 # IPs — update before first run, or override via environment variables
-PHONE_STREAM_URL  = os.environ.get("PHONE_STREAM_URL", "http://10.86.116.184:8080/video")
+PHONE_STREAM_URL  = os.environ.get("PHONE_STREAM_URL", "http://10.176.191.219:8080/video")
 S3_STREAM_URL     = os.environ.get("S3_STREAM_URL", "http://esp-cam.local:81/stream")
 BOT_IP            = os.environ.get("BOT_IP", "esp-bot.local")
 BOT_PORT          = int(os.environ.get("BOT_PORT", "4210"))

@@ -63,6 +63,7 @@ from arena_config import (
     INSPECT_STREAM_STALE_S, INSPECT_SAFETY_S,
     INSPECT_BACKOFF, INSPECT_BACKOFF_STEP_MM, INSPECT_BACKOFF_MAX_MM,
     INSPECT_BACKOFF_SETTLE_TICKS, INSPECT_BACKOFF_HOLD_TICKS,
+    INSPECT_PRECAPTURE, INSPECT_PRECAPTURE_TTL_S, INSPECT_PRECAPTURE_DELAY_S,
     APPROACH_YAW_KP, ALIGN_YAW_KP,
     CAM_FWD, CAM_LAT, AXLE_FWD, AXLE_LAT,
     WATCHDOG_MS,
@@ -224,6 +225,9 @@ class ControlNode(Node):
         self._lat_sign = 1.0                 # sign of the lateral offset currently being corrected
         self._inspect_retries = 0            # failed full-view reads for current box
         self._inspect_timer  = None          # 5 s timeout waiting for ArUco from bot_cam
+        self._precaptured_aruco = None       # box ArUco read early (ALIGNING/APPROACH_SCAN), replayed at INSPECTING
+        self._precapture_ts  = 0.0           # monotonic time of that read (freshness gate)
+        self._precapture_timer = None        # one-shot "scanning" hold before firing the replayed verdict
         self._repair_timer   = None          # drives the mock-repair nudge sequence
         self._mock_phase     = None          # "forward" → "pause" → "reverse" during mock repair
         self._mock_ticks     = 0             # ticks remaining in the current mock-repair phase
@@ -277,6 +281,9 @@ class ControlNode(Node):
             self._maybe_start_next_box()
 
         elif new_state == FSM.NAVIGATING:
+            # New box visit — drop any ArUco cached for the previous box so it can never leak forward.
+            self._precaptured_aruco = None
+            self._cancel_precapture_timer()
             self._navigate_to_current_box()
 
         elif new_state == FSM.ALIGNING:
@@ -301,7 +308,16 @@ class ControlNode(Node):
 
         elif new_state == FSM.INSPECTING:
             self._start_inspection()
-            if ARENA_FREE and INSPECT_BACKOFF:
+            cached = self._take_precapture()
+            if cached is not None:
+                # Already read this box's marker on the way in — replay it after a short hold so it
+                # reads as a scan at the stop, and skip the jerky back-off entirely.
+                self.get_logger().info(
+                    f"Replaying pre-captured ArUco {cached} after {INSPECT_PRECAPTURE_DELAY_S:.1f}s hold"
+                )
+                self._precapture_timer = self.create_timer(
+                    INSPECT_PRECAPTURE_DELAY_S, lambda: self._fire_precapture(cached))
+            elif ARENA_FREE and INSPECT_BACKOFF:
                 if MOVE_PRIMITIVES:
                     self._start_inspect_backoff_prim()
                 else:
@@ -1395,6 +1411,33 @@ class ControlNode(Node):
             self.destroy_timer(self._inspect_timer)
             self._inspect_timer = None
 
+    def _cancel_precapture_timer(self):
+        if self._precapture_timer is not None:
+            self._precapture_timer.cancel()
+            self.destroy_timer(self._precapture_timer)
+            self._precapture_timer = None
+
+    def _take_precapture(self):
+        """Return a fresh, valid pre-captured box ArUco (and clear the cache), or None."""
+        cid = self._precaptured_aruco
+        self._precaptured_aruco = None
+        if not INSPECT_PRECAPTURE or cid is None:
+            return None
+        if (time.monotonic() - self._precapture_ts) > INSPECT_PRECAPTURE_TTL_S:
+            return None
+        if cid not in BOX_ARUCO_IDS:
+            return None
+        return cid
+
+    def _fire_precapture(self, cid: int):
+        self._cancel_precapture_timer()
+        if self._state != FSM.INSPECTING:   # only ever resolve a verdict while actually inspecting
+            return
+        self._cancel_inspect_timer()
+        self._cmd_vel_pub.publish(Twist())   # bot is parked at the stop — ensure it holds still
+        self._current_box_id = cid
+        self._resolve_inspection(cid)
+
     def _inspect_safety(self):
         self._cancel_inspect_timer()
         if self._state != FSM.INSPECTING:
@@ -1402,15 +1445,29 @@ class ControlNode(Node):
         self._inspect_miss("safety timeout — inspection did not complete")
 
     def _on_aruco_detected(self, msg: String):
-        if self._state != FSM.INSPECTING:
-            return
         try:
             detected_id = int(msg.data)
         except ValueError:
             return
         if detected_id not in BOX_ARUCO_IDS:
             return
+
+        # The bot usually reads the marker while it's squaring up (ALIGNING) or creeping in
+        # (APPROACH_SCAN) — and bot_cam only republishes on *change*, so a read latched during
+        # ALIGNING is never re-emitted at INSPECTING. Cache it now (last-write-wins: the final,
+        # most square-on read before the stop is the trustworthy one) and replay it at INSPECTING.
+        if INSPECT_PRECAPTURE and self._state in (FSM.ALIGNING, FSM.APPROACH_SCAN):
+            self._precaptured_aruco = detected_id
+            self._precapture_ts = time.monotonic()
+            self.get_logger().info(
+                f"Pre-captured ArUco {detected_id} (during {self._state}) — will replay at INSPECTING"
+            )
+            return
+
+        if self._state != FSM.INSPECTING:
+            return
         self._cancel_inspect_timer()
+        self._cancel_precapture_timer()
         self._stop_inspect_sweep()
         self._stop_inspect_backoff()
         self._abort_primitive()
@@ -1423,6 +1480,7 @@ class ControlNode(Node):
 
     def _inspect_miss(self, reason: str):
         self._cancel_inspect_timer()
+        self._cancel_precapture_timer()
         if self._state != FSM.INSPECTING:
             return
         self._stop_inspect_sweep()
