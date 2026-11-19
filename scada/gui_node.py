@@ -5,7 +5,6 @@ Run via: uv run scada/main.py  (or standalone: uv run scada/gui_node.py)
 Panels:
   Top-left:  Phone cam feed (overhead MJPEG)
   Top-right: Bot cam feed (S3 MJPEG — active only during INSPECTING)
-  Bottom:    Arena schematic map (box dots, bot dot + heading arrow)
   Sidebar:   State badge, TOF, bot pose, box status grid, START/STOP
 
 Thread model:
@@ -43,13 +42,16 @@ try:
     from PyQt5.QtWidgets import (
         QApplication, QMainWindow, QWidget, QLabel, QDialog,
         QPushButton, QVBoxLayout, QHBoxLayout, QSizePolicy, QFrame,
-        QSplitter, QListWidget, QListWidgetItem, QAbstractItemView
+        QSplitter, QListWidget, QListWidgetItem, QAbstractItemView,
+        QLCDNumber,
     )
     from PyQt5.QtCore import (
         Qt, QThread, pyqtSignal, QObject, QTimer, QCoreApplication,
+        QRect,
     )
     from PyQt5.QtGui import (
         QImage, QPixmap, QColor, QPainter, QPen, QBrush, QFont,
+        QPalette,
     )
     # Belt-and-suspenders: also register the path via Qt's own API so it
     # takes precedence over any path baked into a shared library.
@@ -67,7 +69,8 @@ except ImportError:
     (QObject, QThread, QWidget, QMainWindow, QDialog, QTimer,
      QApplication, QLabel, QPushButton, QVBoxLayout, QHBoxLayout,
      QSizePolicy, QFrame, QSplitter, QImage, QPixmap, QColor, QPainter, QPen,
-     QBrush, QFont, QListWidget, QListWidgetItem, QAbstractItemView) = (_Stub,) * 24
+     QBrush, QFont, QListWidget, QListWidgetItem, QAbstractItemView,
+     QLCDNumber, QRect, QPalette) = (_Stub,) * 27
     Qt = _s
     def pyqtSignal(*a, **kw): return None  # noqa: E306
 
@@ -95,44 +98,41 @@ from arena_config import (
 
 # ── visual constants ──────────────────────────────────────────────────────────
 
+BG_0   = "#0a0a0c"
+BG_1   = "#101014"
+BG_2   = "#16161c"
+LINE   = "#2a2a33"
+INK    = "#d7d7cf"
+DIM    = "#6b6b73"
+AMBER  = "#ff8c1a"
+OK     = "#3e8e5a"
+FAULT  = "#c0392b"
+FONT   = '"JetBrains Mono","DejaVu Sans Mono","Consolas",monospace'
+
 STATE_COLORS = {
-    "SETUP":            "#888888",
-    "IDLE":             "#cccccc",
-    "NAVIGATING":       "#4488ff",
-    "ALIGNING":         "#ffcc00",
-    "APPROACH_SCAN":    "#ffcc00",
-    "APPROACH_DOCK":    "#ffcc00",
-    "DOCKING":          "#ffcc00",
-    "INSPECTING":       "#ffcc00",
-    "AWAITING_HUMAN":   "#ff8800",
-    "REVIEWING_QUEUE":  "#0dcaf0",
-    "REPAIRING":        "#ff8800",
-    "RETURNING_HOME":   "#4488ff",
-    "MISSION_COMPLETE": "#00cc88",
+    "SETUP":            DIM,
+    "IDLE":             INK,
+    "NAVIGATING":       INK,
+    "ALIGNING":         INK,
+    "APPROACH_SCAN":    INK,
+    "APPROACH_DOCK":    INK,
+    "DOCKING":          INK,
+    "INSPECTING":       INK,
+    "AWAITING_HUMAN":   AMBER,
+    "REVIEWING_QUEUE":  INK,
+    "REPAIRING":        AMBER,
+    "RETURNING_HOME":   INK,
+    "MISSION_COMPLETE": OK,
 }
 
 BOX_STATUS_STYLES = {
-    "UNKNOWN":  "background:#444; color:#aaa;",
-    "OK":       "background:#116611; color:#aaffaa;",
-    "FAULT":    "background:#881111; color:#ffaaaa;",
-    "QUEUED":   "background:#664400; color:#ffcc88;",
-    "REPAIRED": "background:#006666; color:#aaffff;",
-    "SKIPPED":  "background:#2a0a0a; color:#ff8888; border:1px dashed #cc2200;",
+    "UNKNOWN":  f"background:{BG_2}; color:{DIM}; border:1px solid {LINE};",
+    "OK":       f"background:{BG_2}; color:{OK}; border:1px solid {OK};",
+    "FAULT":    f"background:{BG_2}; color:{FAULT}; border:1px solid {FAULT};",
+    "QUEUED":   f"background:{BG_2}; color:{DIM}; border:1px solid {LINE};",
+    "REPAIRED": f"background:{BG_2}; color:{INK}; border:1px solid {LINE};",
+    "SKIPPED":  f"background:{BG_2}; color:{DIM}; border:1px dashed {AMBER};",
 }
-
-def _box_dot_colors():
-    if not HAS_QT:
-        return {}
-    return {
-        "UNKNOWN":  QColor(100, 100, 100),
-        "OK":       QColor( 50, 180,  50),
-        "FAULT":    QColor(210,  50,  50),
-        "QUEUED":   QColor(200, 130,   0),
-        "REPAIRED": QColor(  0, 180, 180),
-        "SKIPPED":  QColor(160,  50,  50),
-    }
-
-BOX_DOT_COLORS = _box_dot_colors()
 
 
 # ── thread-safe signal bridge ─────────────────────────────────────────────────
@@ -286,6 +286,7 @@ class GuiNode(Node):
                 self._bridge.sig_bot_frame.emit(qi.copy())
             except Exception as e:
                 self.get_logger().error(f"botcam_worker: {e}")
+
     def _on_tof_depth_img(self, msg: RosImage):
         if not hasattr(self, '_last_tof_time'):
             self._last_tof_time = 0.0
@@ -425,13 +426,13 @@ class CameraThread(QThread):
     @staticmethod
     def _placeholder() -> QImage:
         img = QImage(480, 270, QImage.Format_RGB888)
-        img.fill(QColor(20, 20, 25))
+        img.fill(QColor(10, 10, 12))
         if HAS_QT:
             painter = QPainter(img)
-            painter.setPen(QColor(150, 150, 150))
-            font = QFont("Consolas", 14, QFont.Bold)
+            painter.setPen(QColor(107, 107, 115))
+            font = QFont("JetBrains Mono", 11)
             painter.setFont(font)
-            painter.drawText(img.rect(), Qt.AlignCenter, "CAMERA OFFLINE\nWAITING FOR SIGNAL...")
+            painter.drawText(img.rect(), Qt.AlignCenter, "CAMERA OFFLINE\nWAITING FOR SIGNAL")
             painter.end()
         return img
 
@@ -440,114 +441,145 @@ class CameraThread(QThread):
         self.wait(3000)
 
 
-# ── arena schematic map ───────────────────────────────────────────────────────
+# ── pixel-art robot sprite ────────────────────────────────────────────────────
 
-class ArenaMap(QWidget):
+class RobotSprite(QWidget):
+    """96x96 pixel-art robot drawn with filled QRects; heading tick rotates with theta."""
+
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._box_status = {bid: "UNKNOWN" for bid in BOX_ARUCO_IDS}
-        self._bot_pose   = None   # (x_m, y_m, theta_rad) or None
-        self._bg_img     = None
-        self.setMinimumSize(320, 280)
+        self._theta = 0.0
+        self.setFixedSize(96, 96)
+        self.setAttribute(Qt.WA_TranslucentBackground)
 
-    def set_background_image(self, img: QImage):
-        self._bg_img = img
+    def set_theta(self, theta: float):
+        self._theta = theta
         self.update()
-        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.setStyleSheet("background-color: #0d0d1a;")
-
-    def set_box_status(self, box_id: int, status: str):
-        self._box_status[box_id] = status
-        self.update()
-
-    def set_bot_pose(self, x: float, y: float, theta: float):
-        self._bot_pose = (x, y, theta)
-        self.update()
-
-    def _to_widget(self, x_m: float, y_m: float, x0: int, y0: int, sq: int):
-        arena_m = ARENA_SIZE_CM / 100.0
-        wx = x0 + (x_m / arena_m) * sq
-        wy = y0 + sq - (y_m / arena_m) * sq
-        return int(wx), int(wy)
 
     def paintEvent(self, event):
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setRenderHint(QPainter.Antialiasing, False)
 
-        margin = 32
-        total_w = self.width()  - 2 * margin
-        total_h = self.height() - 2 * margin
-        sq = min(total_w, total_h)
-        x0 = margin + (total_w - sq) // 2
-        y0 = margin + (total_h - sq) // 2
+        cx, cy = 48, 48
+        amber  = QColor(0xff, 0x8c, 0x1a)
+        dim    = QColor(0x6b, 0x6b, 0x73)
+        dark   = QColor(0x2a, 0x2a, 0x33)
+        ink    = QColor(0xd7, 0xd7, 0xcf)
 
-        # arena background
-        if self._bg_img is not None:
-            inset = int((0.075 / 2.0) * sq)
-            side  = sq - 2 * inset
-            painter.drawImage(
-                x0 + inset, y0 + inset,
-                self._bg_img.scaled(side, side, Qt.IgnoreAspectRatio, Qt.SmoothTransformation),
-            )
-        else:
-            painter.setPen(QPen(QColor(60, 60, 90), 2))
-            painter.setBrush(QColor(15, 15, 25))
-            painter.drawRect(x0, y0, sq, sq)
+        def px(x, y, w, h, color):
+            painter.fillRect(QRect(x, y, w, h), color)
 
-        painter.setOpacity(0.7)
+        # chassis body
+        px(28, 36, 40, 28, amber)
+        # chassis shading (right side, bottom)
+        px(60, 36, 8,  28, QColor(0xcc, 0x6a, 0x10))
+        px(28, 56, 40,  8, QColor(0xcc, 0x6a, 0x10))
+        # head
+        px(34, 24, 28, 14, amber)
+        px(56, 24,  6, 14, QColor(0xcc, 0x6a, 0x10))
+        # eyes
+        px(38, 28,  6,  5, dark)
+        px(50, 28,  6,  5, dark)
+        px(39, 29,  4,  3, ink)
+        px(51, 29,  4,  3, ink)
+        # left wheel
+        px(20, 40, 10, 20, dim)
+        px(20, 44,  4, 12, dark)
+        # right wheel
+        px(66, 40, 10, 20, dim)
+        px(72, 44,  4, 12, dark)
+        # antenna
+        px(47, 16,  2, 10, dim)
+        px(44, 14,  8,  4, dim)
+        # chest sensor strip
+        px(34, 44, 28,  4, dark)
+        px(36, 44,  4,  4, QColor(0x3e, 0x8e, 0x5a))
+        px(44, 44,  4,  4, amber)
 
-        painter.setPen(QColor(120, 120, 150))
-        painter.setFont(QFont("Consolas", 10, QFont.Bold))
-        painter.drawText(x0 + 4, y0 - 6,
-                         f"ARENA BLUEPRINT ({ARENA_SIZE_CM} × {ARENA_SIZE_CM} cm)")
-
-        # faint grid every 50 cm
-        painter.setPen(QPen(QColor(40, 50, 80), 1, Qt.DashLine))
-        steps = int(ARENA_SIZE_CM / 50)
-        for i in range(1, steps):
-            frac = i / steps
-            xt = x0 + int(frac * sq)
-            yt = y0 + int(frac * sq)
-            painter.drawLine(xt, y0, xt, y0 + sq)
-            painter.drawLine(x0, yt, x0 + sq, yt)
-
-        # box dots
-        for box_id, (bx_m, by_m) in BOX_POSITIONS.items():
-            status = self._box_status.get(box_id, "UNKNOWN")
-            color  = BOX_DOT_COLORS.get(status, BOX_DOT_COLORS["UNKNOWN"])
-            wx, wy = self._to_widget(bx_m, by_m, x0, y0, sq)
-
-            painter.setBrush(QBrush(color))
-            pen = (QPen(QColor(200, 50, 50), 2, Qt.DashLine)
-                   if status == "SKIPPED"
-                   else QPen(QColor(220, 220, 220), 1))
-            painter.setPen(pen)
-            painter.drawEllipse(wx - 6, wy - 6, 12, 12)
-
-            painter.setPen(QColor(255, 255, 255))
-            painter.setFont(QFont("Consolas", 10, QFont.Bold))
-            painter.drawText(wx - 8, wy - 10, str(box_id))
-
-        # bot dot + heading arrow
-        if self._bot_pose is not None:
-            bx, by, theta = self._bot_pose
-            # Visually offset the dot forward by 6cm so it sits on the chassis center
-            bx += 0.06 * math.cos(theta)
-            by += 0.06 * math.sin(theta)
-            
-            wx, wy = self._to_widget(bx, by, x0, y0, sq)
-            painter.setBrush(QBrush(QColor(0, 140, 255)))
-            painter.setPen(QPen(QColor(255, 255, 255), 1))
-            painter.drawEllipse(wx - 9, wy - 9, 18, 18)
-            dx = int(24 * math.cos(theta))
-            dy = int(-24 * math.sin(theta))
-            painter.setPen(QPen(QColor(255, 220, 0), 2))
-            painter.drawLine(wx, wy, wx + dx, wy + dy)
+        # heading tick — a short line from centre outward in the direction of theta
+        painter.setPen(QPen(amber, 2))
+        tick_len = 28
+        dx = int(tick_len * math.cos(self._theta))
+        dy = int(-tick_len * math.sin(self._theta))
+        painter.drawLine(cx, cy, cx + dx, cy + dy)
 
         painter.end()
 
 
+# ── dot-matrix stat tile ──────────────────────────────────────────────────────
+
+class SegTile(QWidget):
+    """Bordered stat tile: small DIM caption above a QLCDNumber with AMBER segments."""
+
+    def __init__(self, caption: str, digits: int = 6, parent=None):
+        super().__init__(parent)
+        self.setStyleSheet(
+            f"background:{BG_1}; border:1px solid {LINE};"
+        )
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(6, 4, 6, 4)
+        layout.setSpacing(2)
+
+        cap_lbl = QLabel(caption.upper())
+        cap_lbl.setAlignment(Qt.AlignCenter)
+        cap_lbl.setStyleSheet(
+            f"background:transparent; border:none; color:{DIM};"
+            f"font-family:{FONT}; font-size:9px; letter-spacing:1px;"
+        )
+        layout.addWidget(cap_lbl)
+
+        self._lcd = QLCDNumber(digits)
+        self._lcd.setSegmentStyle(QLCDNumber.Flat)
+        self._lcd.setFrameShape(QFrame.NoFrame)
+        self._lcd.setFixedHeight(36)
+
+        palette = self._lcd.palette()
+        palette.setColor(QPalette.WindowText, QColor(AMBER))
+        palette.setColor(QPalette.Background, QColor(BG_2))
+        palette.setColor(QPalette.Dark,       QColor(BG_2))
+        palette.setColor(QPalette.Light,      QColor(BG_2))
+        self._lcd.setPalette(palette)
+        self._lcd.setAutoFillBackground(True)
+        self._lcd.setStyleSheet(f"background:{BG_2}; border:none;")
+        layout.addWidget(self._lcd)
+
+    def display(self, value):
+        self._lcd.display(value)
+
+
 # ── repair modal ──────────────────────────────────────────────────────────────
+
+_BTN_BASE = (
+    f"QPushButton {{"
+    f"  background:{BG_2}; color:{INK};"
+    f"  font-family:{FONT}; font-size:13px; font-weight:bold;"
+    f"  padding:10px; border:1px solid {LINE}; border-radius:0px;"
+    f"}}"
+    f"QPushButton:hover {{ border-color:{AMBER}; color:{AMBER}; }}"
+)
+
+_BTN_PRIMARY = (
+    f"QPushButton {{"
+    f"  background:{AMBER}; color:{BG_0};"
+    f"  font-family:{FONT}; font-size:13px; font-weight:bold;"
+    f"  padding:10px; border:1px solid {AMBER}; border-radius:0px;"
+    f"}}"
+    f"QPushButton:hover {{ background:#ffaa50; border-color:#ffaa50; }}"
+)
+
+_BTN_STOP = (
+    f"QPushButton {{"
+    f"  background:{BG_2}; color:{FAULT};"
+    f"  font-family:{FONT}; font-size:13px; font-weight:bold;"
+    f"  padding:10px; border:1px solid {FAULT}; border-radius:0px;"
+    f"}}"
+    f"QPushButton:hover {{ background:{FAULT}; color:{INK}; }}"
+)
+
+_BTN_DISABLED = (
+    f"QPushButton:disabled {{ background:{BG_1}; color:{DIM}; border:1px solid {LINE}; }}"
+)
+
 
 class RepairDialog(QDialog):
     def __init__(self, box_id: int, node: GuiNode, parent=None):
@@ -558,32 +590,27 @@ class RepairDialog(QDialog):
         self.setModal(True)
         self.setMinimumWidth(360)
         self.setStyleSheet(
-            "QDialog { background-color:#1e1e24; border: 2px solid #dc3545; border-radius: 8px; }"
-            "QLabel { color:#ffffff; font-family:'Segoe UI', sans-serif; }"
+            f"QDialog {{ background:{BG_1}; border:1px solid {FAULT}; }}"
+            f"QLabel {{ color:{INK}; font-family:{FONT}; border:none; }}"
         )
 
         layout = QVBoxLayout(self)
-        layout.setSpacing(16)
-        layout.setContentsMargins(24, 24, 24, 24)
+        layout.setSpacing(10)
+        layout.setContentsMargins(20, 20, 20, 20)
 
-        title = QLabel(f"FAULT DETECTED (Box {box_id})")
+        title = QLabel(f"FAULT DETECTED — BOX {box_id}")
         title.setAlignment(Qt.AlignCenter)
         title.setStyleSheet(
-            "font-size: 18px; font-weight: bold; color: #dc3545;"
-            "padding: 10px; background-color: #2b1114; border-radius: 6px;"
+            f"font-size:14px; font-weight:bold; color:{FAULT};"
+            f"padding:8px; background:{BG_2}; border:1px solid {FAULT};"
+            f"font-family:{FONT};"
         )
         layout.addWidget(title)
 
         for label, decision, style in [
-            ("Repair Now",      "REPAIR_NOW",
-             "QPushButton { background:#d97706; color:white; font-weight:bold; border-radius:6px; font-size:14px; padding:10px; } "
-             "QPushButton:hover { background:#b45309; }"),
-            ("Queue for Later", "QUEUE",
-             "QPushButton { background:#4b5563; color:white; font-weight:bold; border-radius:6px; font-size:14px; padding:10px; } "
-             "QPushButton:hover { background:#374151; }"),
-            ("Skip",            "SKIP",
-             "QPushButton { background:#1f2937; color:#9ca3af; font-weight:bold; border-radius:6px; font-size:14px; padding:10px; border:1px solid #374151;} "
-             "QPushButton:hover { background:#111827; }"),
+            ("REPAIR NOW",      "REPAIR_NOW",  _BTN_PRIMARY),
+            ("QUEUE FOR LATER", "QUEUE",       _BTN_BASE),
+            ("SKIP",            "SKIP",        _BTN_BASE),
         ]:
             btn = QPushButton(label)
             btn.setStyleSheet(style)
@@ -603,101 +630,113 @@ class RepairQueueDialog(QDialog):
         super().__init__(parent)
         self._node = node
         self._selected_order = []
-        
+
         self.setWindowTitle("MANAGE REPAIR QUEUE")
         self.setModal(True)
         self.setMinimumWidth(450)
         self.setStyleSheet(
-            "QDialog { background-color:#1e1e24; border: 2px solid #0dcaf0; border-radius: 8px; }"
-            "QLabel { color:#ffffff; font-family:'Segoe UI', sans-serif; font-size: 14px; }"
+            f"QDialog {{ background:{BG_1}; border:1px solid {LINE}; }}"
+            f"QLabel {{ color:{INK}; font-family:{FONT}; font-size:13px; border:none; }}"
         )
-        
+
         layout = QVBoxLayout(self)
-        layout.setSpacing(16)
-        layout.setContentsMargins(24, 24, 24, 24)
-        
+        layout.setSpacing(10)
+        layout.setContentsMargins(20, 20, 20, 20)
+
         title = QLabel("MANAGE REPAIR QUEUE")
         title.setAlignment(Qt.AlignCenter)
         title.setStyleSheet(
-            "font-size: 18px; font-weight: bold; color: #0dcaf0;"
-            "padding: 10px; background-color: #0c2b33; border-radius: 6px;"
+            f"font-size:14px; font-weight:bold; color:{AMBER};"
+            f"padding:8px; background:{BG_2}; border:1px solid {AMBER};"
+            f"font-family:{FONT};"
         )
         layout.addWidget(title)
-        
+
         if not queued_boxes:
             lbl = QLabel("No boxes currently in queue.")
             lbl.setAlignment(Qt.AlignCenter)
             layout.addWidget(lbl)
-            btn = QPushButton("Close")
-            btn.setStyleSheet("QPushButton { background:#374151; color:white; border-radius:6px; font-size:14px; padding:10px; } QPushButton:hover { background:#1f2937; }")
+            btn = QPushButton("CLOSE")
+            btn.setStyleSheet(_BTN_BASE)
             btn.clicked.connect(self.reject)
             layout.addWidget(btn)
             return
-            
-        lbl = QLabel("Click boxes below to add to execution order:")
+
+        lbl = QLabel("Select boxes to add to execution order:")
+        lbl.setStyleSheet(f"color:{DIM}; font-size:11px; font-family:{FONT};")
         layout.addWidget(lbl)
-        
+
         self._box_layout = QHBoxLayout()
         for bid in queued_boxes:
-            btn = QPushButton(f"Box {bid}")
-            btn.setStyleSheet("QPushButton { background:#374151; color:white; border-radius:4px; padding:10px; font-weight:bold; }")
+            btn = QPushButton(f"BOX {bid}")
+            btn.setStyleSheet(_BTN_BASE)
             btn.setCursor(Qt.PointingHandCursor)
             btn.clicked.connect(lambda checked, b=bid: self._toggle_box(b))
             self._box_layout.addWidget(btn)
         layout.addLayout(self._box_layout)
-        
-        self._order_lbl = QLabel("Selected Order: [None]")
-        self._order_lbl.setStyleSheet("color:#0dcaf0; font-weight:bold;")
+
+        self._order_lbl = QLabel("ORDER: [NONE]")
+        self._order_lbl.setStyleSheet(
+            f"color:{AMBER}; font-weight:bold; font-family:{FONT}; font-size:11px;"
+        )
         layout.addWidget(self._order_lbl)
-        
+
         btn_layout = QHBoxLayout()
-        self._skip_btn = QPushButton("Skip All & Finish")
-        self._skip_btn.setStyleSheet("QPushButton { background:#dc3545; color:white; font-weight:bold; border-radius:6px; font-size:14px; padding:10px; } QPushButton:hover { background:#b02a37; }")
+        self._skip_btn = QPushButton("SKIP ALL & FINISH")
+        self._skip_btn.setStyleSheet(_BTN_STOP)
         self._skip_btn.setCursor(Qt.PointingHandCursor)
         self._skip_btn.clicked.connect(self._finish)
-        
-        self._exec_btn = QPushButton("Execute Selected")
-        self._exec_btn.setStyleSheet("QPushButton { background:#198754; color:white; font-weight:bold; border-radius:6px; font-size:14px; padding:10px; } QPushButton:hover { background:#157347; }")
+
+        self._exec_btn = QPushButton("EXECUTE SELECTED")
+        self._exec_btn.setStyleSheet(_BTN_PRIMARY)
         self._exec_btn.setCursor(Qt.PointingHandCursor)
         self._exec_btn.clicked.connect(self._submit)
-        
+
         btn_layout.addWidget(self._skip_btn)
         btn_layout.addWidget(self._exec_btn)
         layout.addLayout(btn_layout)
-        
+
     def _toggle_box(self, box_id):
         if box_id in self._selected_order:
             self._selected_order.remove(box_id)
         else:
             self._selected_order.append(box_id)
-            
+
         for i in range(self._box_layout.count()):
             btn = self._box_layout.itemAt(i).widget()
-            bid_str = btn.text().split("\n")[0].replace("Box ", "")
+            bid_str = btn.text().split("\n")[0].replace("BOX ", "")
             try:
                 bid = int(bid_str)
-            except: continue
-            
+            except Exception:
+                continue
+
             if bid in self._selected_order:
                 idx = self._selected_order.index(bid) + 1
-                btn.setText(f"Box {bid}\n(#{idx})")
-                btn.setStyleSheet("QPushButton { background:#198754; color:white; border-radius:4px; padding:10px; font-weight:bold; }")
+                btn.setText(f"BOX {bid}\n#{idx}")
+                btn.setStyleSheet(
+                    f"QPushButton {{ background:{AMBER}; color:{BG_0};"
+                    f"  font-family:{FONT}; font-size:12px; font-weight:bold;"
+                    f"  padding:8px; border:1px solid {AMBER}; border-radius:0px; }}"
+                    f"QPushButton:hover {{ background:#ffaa50; }}"
+                )
             else:
-                btn.setText(f"Box {bid}")
-                btn.setStyleSheet("QPushButton { background:#374151; color:white; border-radius:4px; padding:10px; font-weight:bold; }")
-                
+                btn.setText(f"BOX {bid}")
+                btn.setStyleSheet(_BTN_BASE)
+
         if self._selected_order:
-            self._order_lbl.setText("Selected Order: " + ", ".join(f"Box {b}" for b in self._selected_order))
+            self._order_lbl.setText(
+                "ORDER: " + " → ".join(f"BOX {b}" for b in self._selected_order)
+            )
         else:
-            self._order_lbl.setText("Selected Order: [None]")
-            
+            self._order_lbl.setText("ORDER: [NONE]")
+
     def _submit(self):
         if not self._selected_order:
-            return 
+            return
         order_str = ",".join(str(x) for x in self._selected_order)
         self._node.publish_decision(f"REPAIR_ORDER:{order_str}")
         self.accept()
-        
+
     def _finish(self):
         self._node.publish_decision("REPAIR_ORDER:NONE")
         self.accept()
@@ -713,11 +752,18 @@ class MainWindow(QMainWindow):
         self._fsm_state     = "SETUP"
         self._repair_dialog = None
         self._blink_on      = True
+        self._box_status    = {bid: "UNKNOWN" for bid in BOX_ARUCO_IDS}
+
+        # bottom-bar live telemetry cache
+        self._bar_tof_mm  = 0.0
+        self._bar_theta   = 0.0
 
         self.setWindowTitle("Warden SCADA")
-        self.resize(1300, 820)
+        self.resize(1300, 760)
         self.setStyleSheet(
-            "background-color:#0b0c10; color:#c5c6c7; font-family:'Segoe UI', Consolas, sans-serif;"
+            f"QMainWindow, QWidget {{ background:{BG_0}; color:{INK}; font-family:{FONT}; }}"
+            f"QFrame[frameShape='4'] {{ background:{LINE}; border:none; max-height:1px; }}"
+            f"QSplitter::handle {{ background:{LINE}; }}"
         )
 
         self._build_ui()
@@ -726,7 +772,6 @@ class MainWindow(QMainWindow):
         self._phone_cam = None
         if "--sim" in sys.argv:
             bridge.sig_phone_frame.connect(self._on_phone_frame)
-            bridge.sig_warp_frame.connect(self._on_warp_frame)
         else:
             self._phone_cam = CameraThread(PHONE_STREAM_URL, fps=20)
             self._phone_cam.frame_ready.connect(self._on_phone_frame)
@@ -735,8 +780,6 @@ class MainWindow(QMainWindow):
         # Bot cam feed is streamed directly via ROS /camera/camera_sensor/image_raw
         # published by bot_cam_node (hardware) or gazebo (sim), avoiding dual-stream collisions.
         bridge.sig_bot_frame.connect(self._on_bot_frame)
-        if "--sim" in sys.argv:
-            bridge.sig_tof_frame.connect(self._on_tof_frame)
 
         self._blink_timer = QTimer()
         self._blink_timer.setInterval(500)
@@ -748,111 +791,221 @@ class MainWindow(QMainWindow):
         central = QWidget()
         self.setCentralWidget(central)
         root = QVBoxLayout(central)
-        root.setSpacing(4)
-        root.setContentsMargins(6, 6, 6, 6)
+        root.setSpacing(0)
+        root.setContentsMargins(0, 0, 0, 0)
 
-        # header
-        hdr = QHBoxLayout()
-        self._hdr_state = QLabel("STATE: SETUP")
-        self._hdr_state.setStyleSheet(
-            f"font-size:15px; font-weight:bold;"
-            f"color:{STATE_COLORS['SETUP']}; padding:3px 10px;"
+        # ── stat tile header row ──────────────────────────────────────────────
+        hdr_container = QWidget()
+        hdr_container.setStyleSheet(f"background:{BG_1}; border-bottom:1px solid {LINE};")
+        hdr = QHBoxLayout(hdr_container)
+        hdr.setContentsMargins(8, 6, 8, 6)
+        hdr.setSpacing(6)
+
+        # state tile (text, not numeric)
+        state_tile = QWidget()
+        state_tile.setStyleSheet(f"background:{BG_1}; border:1px solid {LINE};")
+        state_inner = QVBoxLayout(state_tile)
+        state_inner.setContentsMargins(10, 4, 10, 4)
+        state_inner.setSpacing(2)
+        cap_state = QLabel("STATE")
+        cap_state.setAlignment(Qt.AlignCenter)
+        cap_state.setStyleSheet(
+            f"background:transparent; border:none; color:{DIM};"
+            f"font-family:{FONT}; font-size:9px; letter-spacing:1px;"
         )
-        self._hdr_tof  = QLabel("TOF: --- mm")
-        self._hdr_tof.setStyleSheet("font-size:12px; color:#666; padding:3px 8px;")
-        self._hdr_pose = QLabel("Bot: x=--- y=--- θ=---")
-        self._hdr_pose.setStyleSheet("font-size:12px; color:#666; padding:3px 8px;")
-        hdr.addWidget(self._hdr_state)
-        hdr.addWidget(self._hdr_tof)
-        hdr.addWidget(self._hdr_pose)
+        self._hdr_state = QLabel("SETUP")
+        self._hdr_state.setAlignment(Qt.AlignCenter)
+        self._hdr_state.setStyleSheet(
+            f"background:transparent; border:none;"
+            f"font-family:{FONT}; font-size:16px; font-weight:bold; color:{DIM};"
+        )
+        state_inner.addWidget(cap_state)
+        state_inner.addWidget(self._hdr_state)
+        hdr.addWidget(state_tile, stretch=2)
+
+        self._tile_tof = SegTile("TOF MM", digits=5)
+        self._tile_tof.display(0)
+        hdr.addWidget(self._tile_tof, stretch=1)
+
+        self._tile_theta = SegTile("THETA DEG", digits=4)
+        self._tile_theta.display(0)
+        hdr.addWidget(self._tile_theta, stretch=1)
+
+        self._hdr_pose = QLabel("x=---  y=---")
+        self._hdr_pose.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
+        self._hdr_pose.setStyleSheet(
+            f"color:{DIM}; font-family:{FONT}; font-size:11px; padding:0 10px;"
+        )
+        hdr.addWidget(self._hdr_pose, stretch=1)
         hdr.addStretch()
-        root.addLayout(hdr)
 
-        sep = QFrame(); sep.setFrameShape(QFrame.HLine)
-        sep.setStyleSheet("color:#1e1e2e;"); root.addWidget(sep)
+        root.addWidget(hdr_container)
 
+        # ── body splitter ─────────────────────────────────────────────────────
         body_splitter = QSplitter(Qt.Horizontal)
+        body_splitter.setHandleWidth(1)
         root.addWidget(body_splitter, stretch=1)
 
         left_widget = QWidget()
+        left_widget.setStyleSheet(f"background:{BG_0};")
         left = QVBoxLayout(left_widget)
-        left.setContentsMargins(0, 0, 0, 0)
+        left.setContentsMargins(6, 6, 6, 6)
+        left.setSpacing(6)
 
         cams = QHBoxLayout()
-        self._phone_lbl = self._cam_label("Phone Cam — overhead MJPEG\n(no feed without hardware)")
-        self._bot_lbl   = self._cam_label("Bot Cam (S3)\nWaiting for stream...")
+        cams.setSpacing(6)
+        self._phone_lbl = self._cam_label("OVERHEAD", "MJPEG — NO FEED WITHOUT HARDWARE")
+        self._bot_lbl   = self._cam_label("BOT S3",   "WAITING FOR STREAM")
         cams.addWidget(self._phone_lbl)
         cams.addWidget(self._bot_lbl)
         left.addLayout(cams)
-
-        bottom_row = QHBoxLayout()
-        self._arena = ArenaMap()
-        bottom_row.addWidget(self._arena, stretch=1)
-        
-        self._tof_lbl = self._cam_label("TOF Top-Down\n(activates during --sim)")
-        self._tof_lbl.setStyleSheet("background:#333333; color:#aaa; border:1px solid #1e1e2e; font-size:10px;")
-        bottom_row.addWidget(self._tof_lbl)
-        
-        left.addLayout(bottom_row, stretch=1)
+        left.addStretch()
 
         body_splitter.addWidget(left_widget)
-        
+
         sidebar = self._build_sidebar()
         body_splitter.addWidget(sidebar)
-        
-        body_splitter.setSizes([900, 300])
+        body_splitter.setSizes([960, 300])
 
-    def _cam_label(self, text: str) -> QLabel:
-        lbl = QLabel(text, alignment=Qt.AlignCenter)
-        lbl.setFixedSize(480, 270)
-        lbl.setStyleSheet(
-            "background:#111; color:#444; border:1px solid #1e1e2e; font-size:10px;"
+        # ── bottom status bar ─────────────────────────────────────────────────
+        bar_container = QWidget()
+        bar_container.setFixedHeight(26)
+        bar_container.setStyleSheet(
+            f"background:{BG_1}; border-top:1px solid {LINE};"
         )
-        return lbl
+        bar = QHBoxLayout(bar_container)
+        bar.setContentsMargins(10, 0, 10, 0)
+        bar.setSpacing(0)
+
+        legend = QLabel("START · STOP · QUEUE")
+        legend.setStyleSheet(
+            f"color:{DIM}; font-family:{FONT}; font-size:10px; border:none;"
+        )
+        bar.addWidget(legend)
+        bar.addStretch()
+
+        self._bar_telem = QLabel("SETUP · TOF:--- · θ:---°")
+        self._bar_telem.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self._bar_telem.setStyleSheet(
+            f"color:{DIM}; font-family:{FONT}; font-size:10px; border:none;"
+        )
+        bar.addWidget(self._bar_telem)
+
+        root.addWidget(bar_container)
+
+    def _cam_label(self, caption: str, placeholder: str) -> QWidget:
+        container = QWidget()
+        container.setStyleSheet(
+            f"background:{BG_1}; border:1px solid {LINE};"
+        )
+        vl = QVBoxLayout(container)
+        vl.setContentsMargins(0, 0, 0, 0)
+        vl.setSpacing(0)
+
+        cap = QLabel(caption)
+        cap.setFixedHeight(18)
+        cap.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        cap.setStyleSheet(
+            f"background:{BG_2}; color:{DIM}; border:none; border-bottom:1px solid {LINE};"
+            f"font-family:{FONT}; font-size:9px; letter-spacing:1px; padding:0 6px;"
+        )
+        vl.addWidget(cap)
+
+        feed = QLabel(placeholder, alignment=Qt.AlignCenter)
+        feed.setFixedSize(480, 270)
+        feed.setStyleSheet(
+            f"background:{BG_1}; color:{DIM}; border:none; font-family:{FONT}; font-size:10px;"
+        )
+        feed.setWordWrap(True)
+        vl.addWidget(feed)
+        vl.addStretch()
+
+        # attach the QLabel for frame updates
+        if caption == "OVERHEAD":
+            self._phone_lbl_feed = feed
+        else:
+            self._bot_lbl_feed = feed
+
+        # keep old names pointing to the feed labels for frame slots
+        if caption == "OVERHEAD":
+            container._feed = feed
+            self._phone_lbl = container
+        else:
+            container._feed = feed
+            self._bot_lbl = container
+
+        return container
 
     def _build_sidebar(self) -> QWidget:
         sb = QWidget()
-        sb.setFixedWidth(248)
-        sb.setStyleSheet("background:#090914; border-left:1px solid #1e1e2e;")
+        sb.setFixedWidth(260)
+        sb.setStyleSheet(
+            f"background:{BG_1}; border-left:1px solid {LINE};"
+        )
 
         layout = QVBoxLayout(sb)
         layout.setSpacing(6)
         layout.setContentsMargins(10, 10, 10, 10)
 
-        hdr = QLabel("MISSION CONTROL")
-        hdr.setAlignment(Qt.AlignCenter)
-        hdr.setStyleSheet("color:#555; font-size:11px; letter-spacing:2px;")
-        layout.addWidget(hdr)
+        hdr_lbl = QLabel("MISSION CONTROL")
+        hdr_lbl.setAlignment(Qt.AlignCenter)
+        hdr_lbl.setStyleSheet(
+            f"color:{DIM}; font-family:{FONT}; font-size:9px; letter-spacing:2px; border:none;"
+        )
+        layout.addWidget(hdr_lbl)
+
+        self._sprite = RobotSprite()
+        layout.addWidget(self._sprite, alignment=Qt.AlignHCenter)
 
         self._sb_state = QLabel("SETUP")
         self._sb_state.setAlignment(Qt.AlignCenter)
         self._sb_state.setWordWrap(True)
         self._sb_state.setStyleSheet(
-            f"font-size:17px; font-weight:bold; color:{STATE_COLORS['SETUP']};"
-            "padding:8px; border:1px solid #222; border-radius: 6px;"
+            f"font-family:{FONT}; font-size:14px; font-weight:bold; color:{DIM};"
+            f"padding:6px; border:1px solid {LINE}; background:{BG_2};"
         )
         layout.addWidget(self._sb_state)
 
-        self._sb_tof  = QLabel("TOF: --- mm", alignment=Qt.AlignCenter)
-        self._sb_pose = QLabel("x=---   y=---\nθ=---°",  alignment=Qt.AlignCenter)
-        for w in (self._sb_tof, self._sb_pose):
-            w.setStyleSheet("color:#666; font-size:11px;")
-            layout.addWidget(w)
+        tof_row = QHBoxLayout()
+        self._sb_tile_tof = SegTile("TOF MM", digits=5)
+        self._sb_tile_tof.display(0)
+        tof_row.addWidget(self._sb_tile_tof)
+        layout.addLayout(tof_row)
 
-        sep1 = QFrame(); sep1.setFrameShape(QFrame.HLine)
-        sep1.setStyleSheet("color:#222;"); layout.addWidget(sep1)
+        pose_row = QHBoxLayout()
+        self._sb_tile_x     = SegTile("X M",   digits=4)
+        self._sb_tile_y     = SegTile("Y M",   digits=4)
+        self._sb_tile_theta = SegTile("θ DEG", digits=4)
+        for t in (self._sb_tile_x, self._sb_tile_y, self._sb_tile_theta):
+            t.display(0)
+            pose_row.addWidget(t)
+        layout.addLayout(pose_row)
 
-        layout.addWidget(QLabel("Box Status:"))
+        sep1 = QFrame()
+        sep1.setFrameShape(QFrame.HLine)
+        sep1.setStyleSheet(f"background:{LINE}; max-height:1px; border:none;")
+        layout.addWidget(sep1)
+
+        box_hdr = QLabel("BOX STATUS")
+        box_hdr.setStyleSheet(
+            f"color:{DIM}; font-family:{FONT}; font-size:9px; letter-spacing:1px; border:none;"
+        )
+        layout.addWidget(box_hdr)
+
         self._box_labels: dict = {}
         for bid in BOX_ARUCO_IDS:
             row = QHBoxLayout()
-            id_lbl = QLabel(f"Box {bid}")
-            id_lbl.setFixedWidth(52)
-            id_lbl.setStyleSheet("color:#555; font-size:11px;")
+            row.setSpacing(6)
+            id_lbl = QLabel(f"BOX {bid}")
+            id_lbl.setFixedWidth(56)
+            id_lbl.setStyleSheet(
+                f"color:{DIM}; font-family:{FONT}; font-size:10px; border:none;"
+            )
             st_lbl = QLabel("UNKNOWN")
             st_lbl.setAlignment(Qt.AlignCenter)
             st_lbl.setStyleSheet(
-                BOX_STATUS_STYLES["UNKNOWN"] + " font-size:11px; padding:2px 4px;"
+                BOX_STATUS_STYLES["UNKNOWN"]
+                + f" font-family:{FONT}; font-size:10px; padding:2px 4px;"
             )
             self._box_labels[bid] = st_lbl
             row.addWidget(id_lbl)
@@ -861,21 +1014,15 @@ class MainWindow(QMainWindow):
 
         layout.addStretch()
 
-        sep2 = QFrame(); sep2.setFrameShape(QFrame.HLine)
-        sep2.setStyleSheet("color:#222;"); layout.addWidget(sep2)
+        sep2 = QFrame()
+        sep2.setFrameShape(QFrame.HLine)
+        sep2.setStyleSheet(f"background:{LINE}; max-height:1px; border:none;")
+        layout.addWidget(sep2)
 
         self._queue_btn = QPushButton("MANAGE REPAIR QUEUE")
         self._queue_btn.setCursor(Qt.PointingHandCursor)
         self._queue_btn.setStyleSheet(
-            """
-            QPushButton {
-                background-color: #0dcaf0; color: #000000;
-                font-size: 13px; font-weight: bold; padding: 10px;
-                border: 1px solid #0aa2c0; border-radius: 6px;
-            }
-            QPushButton:hover { background-color: #31d2f2; }
-            QPushButton:disabled { background-color: #1a2a30; color: #444; border: 1px solid #222; }
-            """
+            _BTN_BASE + _BTN_DISABLED
         )
         self._queue_btn.setEnabled(False)
         self._queue_btn.clicked.connect(self._open_queue_dialog)
@@ -883,31 +1030,13 @@ class MainWindow(QMainWindow):
 
         self._start_btn = QPushButton("START RUN")
         self._start_btn.setCursor(Qt.PointingHandCursor)
-        self._start_btn.setStyleSheet(
-            """
-            QPushButton {
-                background-color: #198754; color: white;
-                font-size: 14px; font-weight: bold; padding: 10px;
-                border: 1px solid #146c43; border-radius: 6px;
-            }
-            QPushButton:hover { background-color: #157347; }
-            """
-        )
+        self._start_btn.setStyleSheet(_BTN_PRIMARY)
         self._start_btn.clicked.connect(self._on_start)
         layout.addWidget(self._start_btn)
 
         stop_btn = QPushButton("STOP BOT")
         stop_btn.setCursor(Qt.PointingHandCursor)
-        stop_btn.setStyleSheet(
-            """
-            QPushButton {
-                background-color: #dc3545; color: white;
-                font-size: 13px; font-weight: bold; padding: 8px;
-                border: 1px solid #b02a37; border-radius: 6px;
-            }
-            QPushButton:hover { background-color: #bb2d3b; }
-            """
-        )
+        stop_btn.setStyleSheet(_BTN_STOP)
         stop_btn.clicked.connect(self._on_stop)
         layout.addWidget(stop_btn)
 
@@ -927,35 +1056,36 @@ class MainWindow(QMainWindow):
         pix = QPixmap.fromImage(img).scaled(
             480, 270, Qt.KeepAspectRatio, Qt.SmoothTransformation
         )
-        self._phone_lbl.setPixmap(pix)
-
-    def _on_warp_frame(self, img: QImage):
-        self._arena.set_background_image(img)
+        self._phone_lbl_feed.setPixmap(pix)
 
     def _on_bot_frame(self, img: QImage):
         pix = QPixmap.fromImage(img).scaled(
             480, 270, Qt.KeepAspectRatio, Qt.SmoothTransformation
         )
-        self._bot_lbl.setPixmap(pix)
-
-    def _on_tof_frame(self, img: QImage):
-        pix = QPixmap.fromImage(img).scaled(
-            480, 270, Qt.KeepAspectRatio, Qt.SmoothTransformation
-        )
-        self._tof_lbl.setPixmap(pix)
+        self._bot_lbl_feed.setPixmap(pix)
 
     def _on_fsm_state(self, state: str):
         self._fsm_state = state
-        color = STATE_COLORS.get(state, "#cccccc")
+        color = STATE_COLORS.get(state, INK)
 
-        for lbl, prefix, font in [
-            (self._hdr_state, "STATE: ",
-             "font-size:15px; font-weight:bold; padding:3px 10px;"),
-            (self._sb_state,  "",
-             "font-size:17px; font-weight:bold; padding:8px; border:1px solid #222;"),
-        ]:
-            lbl.setText(prefix + state)
-            lbl.setStyleSheet(f"color:{color}; {font}")
+        self._hdr_state.setText(state)
+        self._hdr_state.setStyleSheet(
+            f"background:transparent; border:none;"
+            f"font-family:{FONT}; font-size:16px; font-weight:bold; color:{color};"
+        )
+
+        self._sb_state.setText(state)
+        self._sb_state.setStyleSheet(
+            f"font-family:{FONT}; font-size:14px; font-weight:bold; color:{color};"
+            f"padding:6px; border:1px solid {LINE}; background:{BG_2};"
+        )
+
+        self._bar_telem.setText(
+            f"{state} · TOF:{self._bar_tof_mm:.0f} · θ:{math.degrees(self._bar_theta):.0f}°"
+        )
+        self._bar_telem.setStyleSheet(
+            f"color:{color if color != INK else DIM}; font-family:{FONT}; font-size:10px; border:none;"
+        )
 
         if state in ("AWAITING_HUMAN", "REVIEWING_QUEUE"):
             self._blink_timer.start()
@@ -975,8 +1105,9 @@ class MainWindow(QMainWindow):
             self._start_btn.setVisible(True)
             self._start_btn.setText("MISSION COMPLETE")
             self._start_btn.setStyleSheet(
-                "background:#0f5132; color:#d1e7dd;"
-                "font-size:13px; font-weight:bold; padding:8px; border:1px solid #badbcc; border-radius: 6px;"
+                f"QPushButton {{ background:{BG_2}; color:{OK};"
+                f"  font-family:{FONT}; font-size:13px; font-weight:bold;"
+                f"  padding:8px; border:1px solid {OK}; border-radius:0px; }}"
             )
             self._start_btn.setEnabled(False)
 
@@ -990,13 +1121,14 @@ class MainWindow(QMainWindow):
         except ValueError:
             return
 
-        self._arena.set_box_status(box_id, verdict)
+        self._box_status[box_id] = verdict
+
         lbl = self._box_labels.get(box_id)
         if lbl:
             lbl.setText(verdict)
             lbl.setStyleSheet(
                 BOX_STATUS_STYLES.get(verdict, BOX_STATUS_STYLES["UNKNOWN"])
-                + " font-size:11px; padding:2px 4px;"
+                + f" font-family:{FONT}; font-size:10px; padding:2px 4px;"
             )
 
         if verdict == "FAULT" and self._repair_dialog is None:
@@ -1007,15 +1139,25 @@ class MainWindow(QMainWindow):
             self._repair_dialog.open()
 
     def _on_bot_pose(self, x: float, y: float, theta: float):
+        self._bar_theta = theta
         deg = math.degrees(theta)
-        self._hdr_pose.setText(f"Bot: x={x:.2f} y={y:.2f} θ={deg:.0f}°")
-        self._sb_pose.setText(f"x={x:.2f}   y={y:.2f}\nθ={deg:.0f}°")
-        self._arena.set_bot_pose(x, y, theta)
+        self._hdr_pose.setText(f"x={x:.2f}  y={y:.2f}")
+        self._tile_theta.display(round(deg))
+        self._sb_tile_x.display(round(x, 2))
+        self._sb_tile_y.display(round(y, 2))
+        self._sb_tile_theta.display(round(deg))
+        self._sprite.set_theta(theta)
+        self._bar_telem.setText(
+            f"{self._fsm_state} · TOF:{self._bar_tof_mm:.0f} · θ:{deg:.0f}°"
+        )
 
     def _on_tof_reading(self, mm: float):
-        txt = f"TOF: {mm:.0f} mm"
-        self._hdr_tof.setText(txt)
-        self._sb_tof.setText(txt)
+        self._bar_tof_mm = mm
+        self._tile_tof.display(round(mm))
+        self._sb_tile_tof.display(round(mm))
+        self._bar_telem.setText(
+            f"{self._fsm_state} · TOF:{mm:.0f} · θ:{math.degrees(self._bar_theta):.0f}°"
+        )
 
     def _on_start(self):
         self._node.publish_decision("START")
@@ -1025,7 +1167,7 @@ class MainWindow(QMainWindow):
         self._node.publish_stop()
 
     def _open_queue_dialog(self):
-        queued_boxes = [bid for bid, st in self._arena._box_status.items() if st == "QUEUED"]
+        queued_boxes = [bid for bid, st in self._box_status.items() if st == "QUEUED"]
         self._queue_dialog = RepairQueueDialog(queued_boxes, self._node, parent=self)
         self._queue_dialog.finished.connect(
             lambda _: setattr(self, "_queue_dialog", None)
@@ -1037,10 +1179,10 @@ class MainWindow(QMainWindow):
         state = self._fsm_state
         if state not in STATE_COLORS:
             return
-        color = STATE_COLORS[state] if self._blink_on else "#333333"
+        color = STATE_COLORS[state] if self._blink_on else BG_2
         self._sb_state.setStyleSheet(
-            f"color:{color}; font-size:17px; font-weight:bold;"
-            "padding:8px; border:1px solid #222; border-radius: 6px;"
+            f"font-family:{FONT}; font-size:14px; font-weight:bold; color:{color};"
+            f"padding:6px; border:1px solid {LINE}; background:{BG_2};"
         )
 
     def closeEvent(self, event):
