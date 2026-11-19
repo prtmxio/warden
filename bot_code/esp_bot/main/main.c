@@ -18,6 +18,7 @@
  *   UART1: GPIO4  → GPIO2   (GPIO4 now used for STBY)
  */
 
+#include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <errno.h>
@@ -38,6 +39,7 @@
 #include "driver/ledc.h"
 #include "driver/i2c_master.h"
 #include "driver/uart.h"
+#include "led_strip.h"
 
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
@@ -156,6 +158,17 @@ static QueueHandle_t s_prim_q;
 /* ── Indicator LED ──────────────────────────────────────────────────────── */
 
 #define PIN_LED  GPIO_NUM_47
+
+/* ── RGB status LED (onboard WS2812 on GPIO48) ──────────────────────────── */
+
+#define PIN_RGB        GPIO_NUM_48   /* onboard addressable WS2812 */
+#define RGB_BRIGHTNESS 255           /* 0-255 global brightness cap; 255 = full */
+
+/* hold_ms == 0 → set persistent base colour; > 0 → flash then revert to base */
+typedef struct { uint8_t r, g, b; uint32_t hold_ms; } rgb_cmd_t;
+static led_strip_handle_t s_rgb;
+static QueueHandle_t      s_rgb_q;
+static rgb_cmd_t          s_rgb_base = {0, 0, 0, 0};
 
 /* Shared handles; NULL if sensor failed to init */
 static i2c_master_bus_handle_t s_vl53_bus = NULL;
@@ -810,6 +823,11 @@ static void udp_rx_task(void *arg)
         } else if (strcmp(rx_buf, "SCAN") == 0) {
             uart_write_bytes(UART_NUM_1, "SCAN\n", 5);
             ESP_LOGI(TAG, "SCAN forwarded to S3");
+        } else if (strncmp(rx_buf, "LED:", 4) == 0) {
+            unsigned int r = 0, g = 0, b = 0, ms = 0;
+            sscanf(rx_buf + 4, "%u,%u,%u,%u", &r, &g, &b, &ms);
+            rgb_cmd_t pc = {(uint8_t)r, (uint8_t)g, (uint8_t)b, ms};
+            xQueueSend(s_rgb_q, &pc, 0);
         } else {
             sendto(s_sock, rx_buf, n, 0,
                    (struct sockaddr *)&sender, sender_len);
@@ -952,6 +970,63 @@ static void primitive_task(void *arg)
     }
 }
 
+/* ── RGB status LED ─────────────────────────────────────────────────────── */
+
+static void rgb_init(void)
+{
+    led_strip_config_t strip_cfg = {
+        .strip_gpio_num = PIN_RGB,
+        .max_leds       = 1,
+    };
+    led_strip_rmt_config_t rmt_cfg = {
+        .resolution_hz = 10 * 1000 * 1000,   /* 10 MHz RMT tick */
+    };
+    if (led_strip_new_rmt_device(&strip_cfg, &rmt_cfg, &s_rgb) == ESP_OK) {
+        led_strip_clear(s_rgb);
+    } else {
+        ESP_LOGW(TAG, "RGB LED init failed");
+        s_rgb = NULL;
+    }
+}
+
+static void rgb_set(uint8_t r, uint8_t g, uint8_t b)
+{
+    if (!s_rgb) return;
+    led_strip_set_pixel(s_rgb, 0,
+                        (uint32_t)r * RGB_BRIGHTNESS / 255,
+                        (uint32_t)g * RGB_BRIGHTNESS / 255,
+                        (uint32_t)b * RGB_BRIGHTNESS / 255);
+    led_strip_refresh(s_rgb);
+}
+
+/*
+ * Drives the WS2812 from LED commands. A command with hold_ms == 0 sets the
+ * persistent base colour; hold_ms > 0 flashes the colour for that long. A flash
+ * always runs its full duration — base-colour updates that arrive during a
+ * flash are stored and only displayed once the flash expires. This lets SCADA
+ * fire a verdict flash and immediately transition to the next state's base
+ * colour without the flash being clobbered.
+ */
+static void rgb_task(void *arg)
+{
+    rgb_cmd_t pc;
+    uint32_t flash_until = 0;
+    while (1) {
+        if (xQueueReceive(s_rgb_q, &pc, pdMS_TO_TICKS(20)) == pdTRUE) {
+            if (pc.hold_ms == 0) {
+                s_rgb_base = pc;
+                if (now_ms() >= flash_until) rgb_set(pc.r, pc.g, pc.b);
+            } else {
+                flash_until = now_ms() + pc.hold_ms;
+                rgb_set(pc.r, pc.g, pc.b);
+            }
+        } else if (flash_until && now_ms() >= flash_until) {
+            flash_until = 0;
+            rgb_set(s_rgb_base.r, s_rgb_base.g, s_rgb_base.b);
+        }
+    }
+}
+
 /* ── Repair task ────────────────────────────────────────────────────────── */
 /*
  * Waits indefinitely for a task notification (sent by udp_rx_task on REPAIR_MODE).
@@ -1043,6 +1118,12 @@ void app_main(void)
     gpio_config(&led_cfg);
     gpio_set_level(PIN_LED, 0);
 
+    /* RGB status LED */
+    s_rgb_q = xQueueCreate(8, sizeof(rgb_cmd_t));
+    rgb_init();
+    rgb_set(30, 30, 30);   /* dim white on boot */
+    s_rgb_base = (rgb_cmd_t){30, 30, 30, 0};
+
     /* VL53L0X init runs before Wi-Fi so failures are visible immediately */
     vl53l0x_init();
 
@@ -1081,6 +1162,7 @@ void app_main(void)
     xTaskCreate(watchdog_task,  "watchdog", 1024, NULL, 7, NULL);
     xTaskCreate(repair_task,    "repair",   2048, NULL, 5, &s_repair_task_handle);
     xTaskCreate(primitive_task, "prim",     4096, NULL, 6, NULL);
+    xTaskCreate(rgb_task,       "rgb",      2048, NULL, 3, NULL);
 
     ESP_LOGI(TAG, "All tasks started — ready");
 }
