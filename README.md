@@ -28,6 +28,7 @@
    - [7.5 udp_bridge_node.py — ROS2 ↔ UDP](#75-udp_bridge_nodepy--ros2--udp)
    - [7.6 gui_node.py — the dashboard](#76-gui_nodepy--the-dashboard)
    - [7.7 arena_config.py — single source of truth](#77-arena_configpy--single-source-of-truth)
+   - [7.8 RGB status LED (status colours)](#78-rgb-status-led-status-colours)
 8. [The navigation algorithm (pixel-space visual servoing)](#8-the-navigation-algorithm-pixel-space-visual-servoing)
 9. [Encoder motion primitives (TURN / FWD)](#9-encoder-motion-primitives-turn--fwd)
 10. [Odom fusion (latency compensation)](#10-odom-fusion-latency-compensation)
@@ -213,6 +214,8 @@ FWD:<mm>\n                 Closed-loop straight drive by <mm>, signed (encoder p
 SCAN\n                     Forwarded over UART1 to the inspector camera.
 REPAIR_MODE\n              Notifies the firmware repair task.
 REPAIR_STOP\n              Ends the firmware repair forward drive.
+LED:<r>,<g>,<b>\n          Set persistent status colour (0-255 each; firmware caps brightness).
+LED:<r>,<g>,<b>,<ms>\n     Flash that colour for <ms>, then revert to the last persistent colour.
 ```
 
 **Controller → SCADA:**
@@ -279,23 +282,17 @@ warden/
 │   ├── gui_node.py               ← PyQt5 dashboard
 │   ├── arena_config.py           ← ALL tunables, IPs, marker IDs, geometry, fault_config
 │   └── nav2_config/
-│       ├── bringup.launch.py     ← full-stack launch file
-│       ├── ekf.yaml              ← robot_localization config
-│       ├── nav2_params.yaml      ← Nav2 params
-│       └── navigate_simple.xml   ← behaviour-tree
+│       └── bringup.launch.py     ← launch file (arena-free: starts the 4 live nodes;
+│                                    legacy ekf.yaml / nav2_params.yaml retained, unused)
 │
 ├── scripts/                      ← standalone debug/calibration (NO ROS2 import)
 │   ├── aruco_gen.py              ← generate the marker PNGs
 │   ├── stream_test.py            ← phone MJPEG + FPS + ArUco overlay
-│   ├── warp_live_test.py         ← homography calibration from corner markers
-│   ├── contour_test.py           ← HSV/min-area contour tuner (+ bounding-rect overlay)
-│   ├── box_detect.py             ← box blob detection sandbox
 │   ├── mock_bot.py               ← fake controller UDP server for SCADA testing
 │   ├── udp_echo.py               ← pretty-print every bot UDP packet
 │   ├── tof_plot.py               ← live VL53L0X distance plot
 │   ├── encoder_plot.py           ← live encoder tick + velocity plot
 │   ├── odom_calib.py             ← drive 1 m, read summed ODOM → derive TICKS_PER_M
-│   ├── ekf_plot.py               ← camera / odom / EKF trajectory overlay
 │   └── bot_cam_test.py           ← inspector stream + ArUco decode test
 │
 ├── sim/                          ← Gazebo simulation
@@ -377,8 +374,10 @@ protocol, and the watchdog. The motion strategy is detailed in
 | `REPAIRING` | Mock repair: nose in, pause, reverse the same distance back |
 | `RETURNING_HOME` / `MISSION_COMPLETE` | — |
 
-`_transition` logs every change (`[HH:MM:SS] FSM: OLD → NEW`), re-publishes `/fsm_state`, and
-dispatches the entry action for the new state.
+`_transition` logs every change (`[HH:MM:SS] FSM: OLD → NEW`), re-publishes `/fsm_state`,
+dispatches the entry action for the new state, and sets the bot's **status colour** for that
+state; momentary verdicts (OK / FAULT / REPAIRED / UNKNOWN) are flashed. See
+[§7.8](#78-rgb-status-led-status-colours).
 
 **START → patrol plan:** on the `START` operator decision, `_snapshot_visit_queue` locks the
 box list. It applies the **snapshot persistence filter**: a beacon must appear in at least
@@ -461,6 +460,35 @@ cyan · `SKIPPED` dashed red.
 
 Every tunable, IP, marker ID, geometry offset, and `fault_config` lives here. No IPs or magic
 numbers are hard-coded in the nodes. See [§15 Key constants](#15-key-constants).
+
+### 7.8 RGB status LED (status colours)
+
+The bot carries an onboard **WS2812** RGB LED (GPIO48) that shows what it is doing. True to the
+dumb-actuator rule, **the firmware decides nothing** — `control_node` picks the colour (the
+FAULT/OK verdict only exists on the laptop) and sends it as a `LED:` packet
+([§4](#4-network-ports--wire-protocols)); the firmware just drives whatever it is handed.
+
+Each **FSM state** sets a *persistent* colour (held until the next change); each momentary
+**verdict** is *flashed* for `LED_FLASH_MS` (~1.5 s) and then auto-reverts to the state colour.
+The scheme is the single source of truth in `arena_config.LED_COLORS` (state→colour map in
+`control_node.STATE_LED`):
+
+| State / event | Colour | Meaning |
+|---|---|---|
+| `IDLE` | dim blue | ready / between boxes |
+| `NAVIGATING`, `RETURNING_HOME` | cyan | homing on a beacon / driving home |
+| `ALIGNING` | amber | squaring up to the box face |
+| `APPROACH_SCAN`, `INSPECTING` | magenta | creeping to scan / reading the marker |
+| `APPROACH_DOCK` | orange | final creep to dock |
+| `REPAIRING` | green | executing the mock repair |
+| `AWAITING_HUMAN` / **FAULT** | red | fault found — operator must decide |
+| **OK** verdict | green **flash** (~1.5 s) | box passed |
+| **REPAIRED** | cyan **flash** (~1.5 s) | repair complete |
+| `MISSION_COMPLETE` | white | run done |
+| inspection **UNKNOWN** | red **flash** (~1.5 s) | inconclusive read |
+
+Boot shows a dim white. Full 0-255 values live in config; the firmware's `RGB_BRIGHTNESS` caps
+global brightness. Firmware mechanism: [§13.1](#131-controller-firmware-bot_codeesp_bot).
 
 ---
 
@@ -666,10 +694,11 @@ Tasks (`app_main` spawns them with these priorities):
 | `watchdog` | 7 | Every 100 ms: if no UDP for `WATCHDOG_TIMEOUT_MS` (500 ms) and not repairing / not running a primitive → STOP motors |
 | `motor` | 6 | Applies the latest `motor_cmd_t` with a slew-rate ramp every 10 ms |
 | `prim` | 6 | Runs a `TURN`/`FWD` primitive to completion on the encoder loop, replies `STATUS:*_DONE` |
-| `udp_rx` | 5 | `recvfrom` loop: parses `LEFT/RIGHT`, `TURN`, `FWD`, `STOP`, `REPAIR_MODE`, `REPAIR_STOP`, `SCAN`; learns SCADA addr; feeds watchdog |
+| `udp_rx` | 5 | `recvfrom` loop: parses `LEFT/RIGHT`, `TURN`, `FWD`, `STOP`, `REPAIR_MODE`, `REPAIR_STOP`, `SCAN`, `LED`; learns SCADA addr; feeds watchdog |
 | `repair` | 5 | Firmware repair cycle (forward → indicator → timed reverse → `STATUS:REPAIRED`) |
 | `encoder` | 4 | Every 50 ms: signed tick deltas → metres, integrate heading, send `ODOM:dl:dr:heading` |
 | `tof` | 3 | Poll VL53L0X interrupt, read range at reg `0x1E`, send `TOF:<mm>` (started only if the sensor inited) |
+| `rgb` | 3 | Drives the onboard WS2812 (GPIO48) from `LED:` commands: holds a base colour, runs a flash for its `ms` then reverts to the base ([§7.8](#78-rgb-status-led-status-colours)) |
 
 **Signed quadrature encoders:** each C1 channel interrupts on its rising edge (`IRAM_ATTR`
 ISR); the C2 phase level sampled inside the ISR gives rotation direction, so counts are signed
@@ -694,8 +723,11 @@ a sensor fault is visible immediately; if the probe fails, the `tof` task is sim
 
 **Networking:** `wifi_init_sta` (station mode, WPA2, up to 10 retries), then `mdns` publishes
 `esp-bot.local`, then a UDP socket binds `:4210`. TX power is capped
-(`esp_wifi_set_max_tx_power(40)`) before the first probe burst. `idf_component.yml` pulls in
-`espressif/mdns`.
+(`esp_wifi_set_max_tx_power(40)`) before the first probe burst.
+
+**RGB status LED:** the onboard WS2812 (GPIO48) is driven via the RMT-based `espressif/led_strip`
+component. `rgb_set` scales each channel by `RGB_BRIGHTNESS/255` (global brightness cap) before
+the strip refresh. `idf_component.yml` pulls in `espressif/mdns` and `espressif/led_strip`.
 
 ### 13.2 Camera firmware (bot_code/esp_cam)
 
@@ -740,7 +772,6 @@ All in `scada/arena_config.py` unless noted. Firmware copies are kept in sync.
 **Geometry / arena**
 ```
 WHEEL_SEPARATION  = 0.12 m      (firmware WHEEL_SEP_M = 0.12f)
-ARENA_SIZE_CM     = 200
 CAM_FWD = 0.20049 m, CAM_LAT = 0.0614 m    (S3 camera offset from base_footprint)
 AXLE_FWD = 0.05549 m, AXLE_LAT = 0.06137 m (wheel-axle = in-place rotation centre)
 ```
@@ -814,6 +845,13 @@ fault_config = {10:"FAULT", 11:"OK", 12:"FAULT", 13:"OK"}
 firmware: TICKS_PER_M = 2465, ENC_L_SIGN = -1, ENC_R_SIGN = +1
 ```
 
+**Status LED** (see [§7.8](#78-rgb-status-led-status-colours))
+```
+LED_FLASH_MS = 1500   (verdict flash hold)
+LED_COLORS = { IDLE, NAV, ALIGN, SCAN, DOCK, REPAIR, FAULT, OK, REPAIRED, DONE, ERROR, OFF }
+              single source of truth; firmware RGB_BRIGHTNESS caps global brightness
+```
+
 ---
 
 ## 16. How to run
@@ -831,6 +869,8 @@ Press **START RUN** in the dashboard to begin the patrol.
 source /opt/ros/humble/setup.bash
 ros2 launch scada/nav2_config/bringup.launch.py
 ```
+In arena-free mode (`ARENA_FREE = True`) this brings up the same four nodes as `main.py`
+(vision, udp_bridge, control, bot_cam) — no Nav2, no EKF — just without the GUI.
 
 **Prerequisites:** phone on hotspot `kafka`, IP Webcam streaming; laptop on `kafka`; both
 ESP32-S3 boards powered and on the hotspot (`esp-bot.local` / `esp-cam.local` resolvable).
@@ -860,10 +900,6 @@ Plain Python + OpenCV/matplotlib/socket — **no ROS2 import**, run without sour
 | `tof_plot.py` | Live VL53L0X distance vs time |
 | `encoder_plot.py` | Live left/right ticks + computed velocity |
 | `odom_calib.py` | Drive a measured 1.0 m, read summed ODOM, derive `TICKS_PER_M` |
-| `ekf_plot.py` | Camera vs odom vs EKF trajectory overlay |
-| `contour_test.py` | HSV / min-area contour tuner with a bounding-rect overlay |
-| `box_detect.py` | Box blob detection sandbox |
-| `warp_live_test.py` | Homography calibration from corner markers |
 | `mock_bot.py` | Fake controller UDP server — test the SCADA stack with no hardware |
 
 **Encoder calibration:** drive exactly 1.0 m straight, read the summed `dl`/`dr` from
