@@ -10,30 +10,11 @@
 
 ## Demo
 
-<table>
-  <tr>
-    <td width="50%" align="center">
-      <a href="res/demo_run.mp4">
-        <img src="res/demo_run_poster.jpg" width="100%" alt="Warden patrolling the arena">
-      </a>
-      <br />
-      <b>▶ On the arena</b><br />
-      <sub>Full autonomous patrol — nav, dock, inspect, repair</sub>
-    </td>
-    <td width="50%" align="center">
-      <a href="res/demo_run_laptop.mp4">
-        <img src="res/demo_run_laptop_poster.jpg" width="100%" alt="SCADA dashboard during the same run">
-      </a>
-      <br />
-      <b>▶ On the dashboard</b><br />
-      <sub>The run seen from the operator SCADA UI (for a different run)</sub>
-    </td>
-  </tr>
-</table>
-
-<sub>The thumbnails link to the `.mp4` files in [`res/`](res/); GitHub opens them in its built-in
-player. For an inline auto-playing clip, drag the file into the GitHub web editor (see
-[§20](#20-updating-the-demo-media)).</sub>
+<div align="center">
+  <video src="https://github.com/user-attachments/assets/8f7a2705-14a3-4715-96a1-cf6c632c1dfb" poster="res/demo_run_poster.jpg" controls muted width="80%"></video>
+  <br />
+  <b>▶ Full autonomous patrol on the arena</b> — nav, dock, inspect, repair
+</div>
 
 ### Hardware
 
@@ -995,38 +976,33 @@ restored from `idf_component.yml` + `dependencies.lock`.
 
 ## 20. Updating the demo media
 
-All demo assets live in [`res/`](res/):
+Demo assets live in [`res/`](res/):
 
 | File | What it is |
 |---|---|
-| `demo_run.mp4` | Full autonomous patrol filmed on the arena |
-| `demo_run_laptop.mp4` | The same run captured from the operator SCADA UI |
-| `demo_run_poster.jpg` / `demo_run_laptop_poster.jpg` | Poster thumbnails linked from the [Demo](#demo) section |
+| `demo_run_poster.jpg` | Poster frame shown before the [Demo](#demo) video plays |
 | `top_view.jpeg` / `side_view.jpeg` / `arena_view.jpeg` | Hardware stills |
 
-**Why posters instead of a direct embed:** GitHub does **not** render a playable `<video>` from
-a repo-relative `.mp4` path. The two reliable options are:
+**How the inline video works:** GitHub does **not** render a playable `<video>` from a
+repo-relative `.mp4` path, so the Demo clip is **not** stored in the repo. Instead it is a
+GitHub **attachment**: the `<video src="…user-attachments/assets/…">` tag in the [Demo](#demo)
+section points at a file GitHub hosts, which plays inline in the README.
 
-1. **Clickable poster → GitHub player (what this README uses).** A poster `.jpg` is linked to the
-   `.mp4`; clicking opens the file on GitHub, which plays it in its built-in viewer. Works
-   straight from the committed files, no external hosting.
-2. **Inline auto-playing clip.** In the GitHub web UI, edit the README and **drag the `.mp4` into
-   the editor**. GitHub uploads it and inserts a `https://github.com/user-attachments/assets/…`
-   URL that renders as an inline player. Paste that URL on its own line where you want the clip.
+**To replace the demo clip:**
 
-**Regenerating a poster** (pick a representative frame, e.g. 8 s in, scaled to 960 px wide):
+1. In the GitHub web UI, open any **New issue** (you don't have to submit it) and **drag the
+   `.mp4` into the comment box**. GitHub uploads it and inserts a
+   `https://github.com/user-attachments/assets/…` URL.
+2. Copy that URL and swap it into the `<video src="…">` tag in the Demo section. The
+   `poster="res/demo_run_poster.jpg"` attribute keeps the preview frame.
 
-```bash
-ffmpeg -ss 8 -i res/demo_run.mp4 -vframes 1 -vf "scale=960:-1" res/demo_run_poster.jpg
-```
-
-**Note on repo size:** the two clips are ~53 MB and ~42 MB. They are within GitHub's 100 MB
-hard limit but above its 50 MB soft warning. To shrink before committing (and still keep them
-clean), re-encode with H.264 CRF 28:
+**Upload tips:** attachments must be ≤ 100 MB, but large files time out on slow links — compress
+first. Dropping the frame rate helps most for screen captures; re-encode a new poster from any
+representative frame:
 
 ```bash
-ffmpeg -i res/demo_run.mp4 -vcodec libx264 -crf 28 -preset slow -an res/demo_run_small.mp4
+# shrink a clip for reliable upload (drop audio, cap fps, H.264)
+ffmpeg -i raw.mp4 -vf "scale=960:-2,fps=20" -vcodec libx264 -crf 30 -an -movflags +faststart small.mp4
+# regenerate the poster (frame 8 s in, 960 px wide)
+ffmpeg -ss 8 -i small.mp4 -vframes 1 -vf "scale=960:-1" res/demo_run_poster.jpg
 ```
-
-Consider [Git LFS](https://git-lfs.com/) if the clips will be updated often, to keep the main
-history light.
