@@ -26,7 +26,7 @@
       </a>
       <br />
       <b>▶ On the dashboard</b><br />
-      <sub>The same run seen from the operator SCADA UI</sub>
+      <sub>The run seen from the operator SCADA UI (for a different run)</sub>
     </td>
   </tr>
 </table>
