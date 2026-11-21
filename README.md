@@ -8,8 +8,60 @@
 
 ---
 
+## Demo
+
+<table>
+  <tr>
+    <td width="50%" align="center">
+      <a href="res/demo_run.mp4">
+        <img src="res/demo_run_poster.jpg" width="100%" alt="Warden patrolling the arena">
+      </a>
+      <br />
+      <b>▶ On the arena</b><br />
+      <sub>Full autonomous patrol — nav, dock, inspect, repair</sub>
+    </td>
+    <td width="50%" align="center">
+      <a href="res/demo_run_laptop.mp4">
+        <img src="res/demo_run_laptop_poster.jpg" width="100%" alt="SCADA dashboard during the same run">
+      </a>
+      <br />
+      <b>▶ On the dashboard</b><br />
+      <sub>The same run seen from the operator SCADA UI</sub>
+    </td>
+  </tr>
+</table>
+
+<sub>The thumbnails link to the `.mp4` files in [`res/`](res/); GitHub opens them in its built-in
+player. For an inline auto-playing clip, drag the file into the GitHub web editor (see
+[§20](#20-updating-the-demo-media)).</sub>
+
+### Hardware
+
+<table>
+  <tr>
+    <td width="33%" align="center">
+      <img src="res/top_view.jpeg" width="100%" alt="Top view of the bot" />
+      <br /><b>Top</b><br />
+      <sub>Bot marker (ID 5), PCB, ESP32-S3, buck + TB6612FNG</sub>
+    </td>
+    <td width="33%" align="center">
+      <img src="res/side_view.jpeg" width="100%" alt="Side profile of the bot" />
+      <br /><b>Side</b><br />
+      <sub>Inspector camera (front), stacked boards, N20 drive</sub>
+    </td>
+    <td width="33%" align="center">
+      <img src="res/arena_view.jpeg" width="100%" alt="The bot and four marked boxes in the arena" />
+      <br /><b>Arena</b><br />
+      <sub>Bot + 4 boxes: top beacons (0–3) & front markers (10–13)</sub>
+    </td>
+  </tr>
+</table>
+
+---
+
 ## Table of Contents
 
+0. [Demo & gallery](#demo)
 1. [What the system does](#1-what-the-system-does)
 2. [System architecture](#2-system-architecture)
 3. [Hardware](#3-hardware)
@@ -43,6 +95,7 @@
 17. [Debug & calibration scripts](#17-debug--calibration-scripts)
 18. [Simulation](#18-simulation)
 19. [Build / flash workflow](#19-build--flash-workflow)
+20. [Updating the demo media](#20-updating-the-demo-media)
 
 ---
 
@@ -937,3 +990,43 @@ idf.py monitor                              # console on USB Serial/JTAG (USB-CD
 
 `managed_components/`, `.cache/`, `build/`, and `sdkconfig.old` are gitignored; dependencies are
 restored from `idf_component.yml` + `dependencies.lock`.
+
+---
+
+## 20. Updating the demo media
+
+All demo assets live in [`res/`](res/):
+
+| File | What it is |
+|---|---|
+| `demo_run.mp4` | Full autonomous patrol filmed on the arena |
+| `demo_run_laptop.mp4` | The same run captured from the operator SCADA UI |
+| `demo_run_poster.jpg` / `demo_run_laptop_poster.jpg` | Poster thumbnails linked from the [Demo](#demo) section |
+| `top_view.jpeg` / `side_view.jpeg` / `arena_view.jpeg` | Hardware stills |
+
+**Why posters instead of a direct embed:** GitHub does **not** render a playable `<video>` from
+a repo-relative `.mp4` path. The two reliable options are:
+
+1. **Clickable poster → GitHub player (what this README uses).** A poster `.jpg` is linked to the
+   `.mp4`; clicking opens the file on GitHub, which plays it in its built-in viewer. Works
+   straight from the committed files, no external hosting.
+2. **Inline auto-playing clip.** In the GitHub web UI, edit the README and **drag the `.mp4` into
+   the editor**. GitHub uploads it and inserts a `https://github.com/user-attachments/assets/…`
+   URL that renders as an inline player. Paste that URL on its own line where you want the clip.
+
+**Regenerating a poster** (pick a representative frame, e.g. 8 s in, scaled to 960 px wide):
+
+```bash
+ffmpeg -ss 8 -i res/demo_run.mp4 -vframes 1 -vf "scale=960:-1" res/demo_run_poster.jpg
+```
+
+**Note on repo size:** the two clips are ~53 MB and ~42 MB. They are within GitHub's 100 MB
+hard limit but above its 50 MB soft warning. To shrink before committing (and still keep them
+clean), re-encode with H.264 CRF 28:
+
+```bash
+ffmpeg -i res/demo_run.mp4 -vcodec libx264 -crf 28 -preset slow -an res/demo_run_small.mp4
+```
+
+Consider [Git LFS](https://git-lfs.com/) if the clips will be updated often, to keep the main
+history light.
