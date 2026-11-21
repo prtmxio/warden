@@ -81,84 +81,38 @@ Every section below is cross-referenced to the source file that implements it.
 
 ## 2. System architecture
 
-
-┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│                              SCADA HUB — LAPTOP (Ubuntu + ROS2 Humble)                                         │
-│                                    Process: uv run scada/main.py                                                │
-│                                                                                                                │
-│  ┌──────────────────────┐  ┌──────────────────────┐  ┌──────────────────────┐  ┌──────────────────────┐       │
-│  │     vision_node      │  │     control_node     │  │     bot_cam_node     │  │       gui_node       │       │
-│  ├──────────────────────┤  ├──────────────────────┤  ├──────────────────────┤  ├──────────────────────┤       │
-│  │ Overhead phone       │  │ Mission FSM          │  │ S3 MJPEG             │  │ PyQt5                │       │
-│  │ ArUco detection      │  │ Pixel-servo homing   │  │ Front marker         │  │ 4-panel dashboard    │       │
-│  │                      │  │                      │  │ IDs 10–13            │  │                      │       │
-│  │ • Bot ID 5           │  │ Primitive align/dock │  │                      │  │ Operator modals      │       │
-│  │ • Box tops 0–3       │  │ Back-off inspect     │  │ Verdict              │  │                      │       │
-│  │                      │  │ Mock repair          │  │                      │  │                      │       │
-│  │ → /bot_px            │  │                      │  │                      │  │                      │       │
-│  │ → /box_px            │  │ → /cmd_vel           │  │                      │  │                      │       │
-│  │                      │  │ → TURN/FWD           │  │                      │  │                      │       │
-│  │                      │  │ → /bot_command       │  │                      │  │                      │       │
-│  └──────────────────────┘  └──────────────────────┘  └──────────────────────┘  └──────────────────────┘       │
-│                                                                                                                │
-│  ┌────────────────────────────────────────────────────────────────────────────────────────────────────────┐  │
-│  │                                      ROS2 COMMUNICATION                                                   │  │
-│  │                                                                                                          │  │
-│  │  /bot_px, /box_px          ──────────────────────► control_node                                          │  │
-│  │  /box_aruco_detected       ──────────────────────► bot_cam_node                                          │  │
-│  │  /bot_cam_status           ──────────────────────► control_node                                          │  │
-│  │  /fsm_state, /inspection   ──────────────────────► gui_node                                              │  │
-│  │                                                                                                          │  │
-│  └────────────────────────────────────────────────────────────────────────────────────────────────────────┘  │
-│                                                                                                                │
-│  ┌────────────────────────────────────────────────────────────────────────────────────────────────────────┐  │
-│  │                                        udp_bridge_node                                                    │  │
-│  │                                                                                                          │  │
-│  │  LAPTOP → ESP32 : /cmd_vel, /bot_command                                                                 │  │
-│  │  ESP32 → LAPTOP : /odom, /tof_range, /bot_status                                                         │  │
-│  │                                                                                                          │  │
-│  └────────────────────────────────────────────────────────────────────────────────────────────────────────┘  │
-└──────────────────────────────────────────────────────────────┬─────────────────────────────────────────────────┘
-                                                               │
-                                                     Wi-Fi UDP (SSID "kafka")
-                                                     Laptop :4211 ↔ ESP32 :4210
-                                                               │
-                                                               ▼
-                                      ┌──────────────────────────────────────────────┐
-                                      │             ESP32-S3 (BOT BRAIN)             │
-                                      ├──────────────────────────────────────────────┤
-                                      │ Host: esp-bot.local                          │
-                                      │                                              │
-                                      │ • TB6612FNG motors                           │
-                                      │ • Quadrature encoders                        │
-                                      │ • VL53L0X TOF (I2C)                          │
-                                      │ • TURN/FWD primitives                        │
-                                      │ • UDP + mDNS                                 │
-                                      │ • 500 ms watchdog                            │
-                                      │                                              │
-                                      │ UART1 TX GPIO2 ───── "SCAN\n" ───────────────┼──────┐
-                                      └──────────────────────────────────────────────┘      │
-                                                                                           │
-                                                                                           ▼
-                                      ┌──────────────────────────────────────────────┐
-                                      │           ESP32-S3 (INSPECTOR)               │
-                                      ├──────────────────────────────────────────────┤
-                                      │ Host: esp-cam.local                          │
-                                      │                                              │
-                                      │ • GC2145 camera                              │
-                                      │ • MJPEG HTTP :81                             │
-                                      │ • /stream                                    │
-                                      │ • mDNS                                       │
-                                      │                                              │
-                                      └──────────────────────┬───────────────────────┘
-                                                             │
-                                                    MJPEG HTTP :81
-                                                             │
-                                                             ▼
-                                      Laptop (bot_cam_node)
-                                                             │
-                                                             │
-PHONE MJPEG (Overhead Camera) ───────────────────────────────► Laptop (vision_node)
+┌──────────────────────────────────────────────────────────────────────────┐
+│                SCADA HUB  (laptop, Ubuntu + ROS2 Humble)                 │
+│                   one process: `uv run scada/main.py`                    │
+│                                                                          │
+│  vision_node        control_node          bot_cam_node      gui_node     │
+│  ───────────        ────────────          ────────────      ────────     │
+│  overhead phone →    mission FSM,          S3 MJPEG →        PyQt5       │
+│  ArUco detect:      pixel-servo homing,   front marker      4-panel      │
+│   • bot ID 5        primitive align/dock, IDs 10-13 →       dashboard,   │
+│   • box tops 0-3    back-off inspect,     verdict           operator     │
+│  → /bot_px          mock repair                             modals       │
+│  → /box_px          → /cmd_vel, TURN/FWD                                 │
+│                     → /bot_command                                       │
+│         │                    │                      ▲             ▲      │
+│         └── /bot_px ────────┤ /box_aruco_detected ─┘             │      │
+│             /box_px         │ /bot_cam_status         /fsm_state │      │
+│         udp_bridge_node ◄───┘ /cmd_vel, /bot_command /inspection─┘      │
+│                └──────────► /odom, /tof_range, /bot_status               │
+└─────────────────────────────┬────────────────────────────────────────────┘
+          phone MJPEG         │ Wi-Fi UDP (SSID "kafka")
+          (overhead cam)      │ laptop :4211  ◄──►  esp-bot.local :4210
+                   ┌──────────▼────────────┐      UART1 115200       ┌────────────────────────┐
+                   │ ESP32-S3  (bot brain) │ TX GPIO2 ──────────────►│ ESP32-S3 (inspector)   │
+                   │ esp-bot.local         │        "SCAN\n"         │ esp-cam.local          │
+                   │ • TB6612FNG motors    │                         │ • GC2145 camera        │
+                   │ • quad encoders       │                         │ • MJPEG HTTP :81       │
+                   │ • VL53L0X TOF (I2C)   │                         │   /stream              │
+                   │ • TURN/FWD primitives │                         │ • mDNS                 │
+                   │ • UDP + mDNS          │                         │                        │
+                   │ • 500 ms watchdog     │                         │                        │
+                   └───────────────────────┘                         └────────────────────────┘
+                                                              MJPEG :81 to laptop (bot_cam_node)
 
 
 
